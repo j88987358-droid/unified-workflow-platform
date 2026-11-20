@@ -1,0 +1,7 @@
+{
+  "platform_name": "AI Business Pain Point Intelligence System",
+  "platform_version": "1.0.0",
+  "plugin_api_version": "1.0",
+  "plugin_directory": "plugins",
+  "dependency_installation": "manual_approval_required"
+}
