@@ -1,0 +1,323 @@
+name: Phase 2A - Security and Compatibility
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase2-security
+  cancel-in-progress: false
+
+jobs:
+  security-core:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create Security Infrastructure
+        run: |
+          mkdir -p platform_core/plugin_system
+          mkdir -p platform_core/dependency_system
+          mkdir -p config
+          mkdir -p tests
+
+          cat > platform_core/plugin_system/validator.py <<'PY'
+          import re
+
+          class PluginManifestValidator:
+
+              REQUIRED = [
+                  "id",
+                  "name",
+                  "version",
+                  "api_version",
+                  "entry_point",
+                  "enabled",
+                  "dependencies",
+                  "permissions"
+              ]
+
+              ALLOWED_PERMISSIONS = {
+                  "network",
+                  "storage",
+                  "logging"
+              }
+
+              def validate(self, manifest):
+
+                  errors = []
+
+                  for key in self.REQUIRED:
+                      if key not in manifest:
+                          errors.append(f"Missing field: {key}")
+
+                  if errors:
+                      return {"valid": False, "errors": errors}
+
+                  if not re.fullmatch(
+                      r"[a-zA-Z0-9_.-]+",
+                      str(manifest["id"])
+                  ):
+                      errors.append("Invalid plugin ID")
+
+                  if not re.fullmatch(
+                      r"\d+\.\d+\.\d+",
+                      str(manifest["version"])
+                  ):
+                      errors.append("Invalid plugin version")
+
+                  if manifest["api_version"] != "1.0":
+                      errors.append("Unsupported plugin API version")
+
+                  if not isinstance(manifest["enabled"], bool):
+                      errors.append("enabled must be boolean")
+
+                  if not isinstance(manifest["dependencies"], list):
+                      errors.append("dependencies must be a list")
+
+                  if not isinstance(manifest["permissions"], list):
+                      errors.append("permissions must be a list")
+
+                  if isinstance(manifest["permissions"], list):
+                      for permission in manifest["permissions"]:
+                          if permission not in self.ALLOWED_PERMISSIONS:
+                              errors.append(
+                                  f"Permission not allowed: {permission}"
+                              )
+
+                  if not isinstance(manifest["entry_point"], str):
+                      errors.append("Invalid entry point")
+
+                  return {
+                      "valid": len(errors) == 0,
+                      "errors": errors
+                  }
+          PY
+
+          cat > platform_core/plugin_system/compatibility.py <<'PY'
+          class PluginCompatibilityChecker:
+
+              CORE_API_VERSION = "1.0"
+
+              def check(self, manifest):
+
+                  plugin_api = manifest.get("api_version")
+
+                  return {
+                      "compatible": plugin_api == self.CORE_API_VERSION,
+                      "core_api": self.CORE_API_VERSION,
+                      "plugin_api": plugin_api
+                  }
+          PY
+
+          cat > platform_core/dependency_system/installer.py <<'PY'
+          import re
+          import subprocess
+          import sys
+          from packaging.requirements import Requirement
+
+          class SecureDependencyInstaller:
+
+              def __init__(self, approved_packages):
+                  self.approved_packages = set(approved_packages)
+
+              def validate(self, dependencies):
+
+                  validated = []
+
+                  for item in dependencies:
+                      requirement = Requirement(item)
+
+                      if requirement.name.lower() not in self.approved_packages:
+                          raise ValueError(
+                              f"Package not approved: {requirement.name}"
+                          )
+
+                      if requirement.url:
+                          raise ValueError("Direct URLs are not allowed")
+
+                      if requirement.extras:
+                          raise ValueError("Package extras are not allowed")
+
+                      specifiers = list(requirement.specifier)
+
+                      if len(specifiers) != 1:
+                          raise ValueError(
+                              "Only exact pinned versions are allowed"
+                          )
+
+                      specifier = specifiers[0]
+
+                      if specifier.operator != "==" or "*" in specifier.version:
+                          raise ValueError(
+                              "Dependency must use an exact version pin"
+                          )
+
+                      if not re.fullmatch(
+                          r"\d+(?:\.\d+){1,3}",
+                          specifier.version
+                      ):
+                          raise ValueError("Invalid pinned version")
+
+                      validated.append(str(requirement))
+
+                  return validated
+
+              def install(self, dependencies, approved=False):
+
+                  packages = self.validate(dependencies)
+
+                  if not approved:
+                      return {
+                          "installed": False,
+                          "status": "APPROVAL_REQUIRED",
+                          "packages": packages
+                      }
+
+                  if packages:
+                      subprocess.run(
+                          [
+                              sys.executable,
+                              "-m",
+                              "pip",
+                              "install",
+                              "--",
+                              *packages
+                          ],
+                          check=True
+                      )
+
+                  return {
+                      "installed": True,
+                      "status": "SUCCESS",
+                      "packages": packages
+                  }
+          PY
+
+          cat > config/approved-dependencies.json <<'JSON'
+          {
+            "approved_packages": [
+              "packaging",
+              "httpx",
+              "pydantic",
+              "feedparser",
+              "beautifulsoup4",
+              "pytest"
+            ]
+          }
+          JSON
+
+          cat > tests/test_phase2_security.py <<'PY'
+          import json
+
+          from pathlib import Path
+
+          from platform_core.plugin_system.validator import (
+              PluginManifestValidator
+          )
+
+          from platform_core.plugin_system.compatibility import (
+              PluginCompatibilityChecker
+          )
+
+          from platform_core.dependency_system.installer import (
+              SecureDependencyInstaller
+          )
+
+          def valid_manifest():
+              return {
+                  "id": "example.collector",
+                  "name": "Example Collector",
+                  "version": "1.0.0",
+                  "api_version": "1.0",
+                  "entry_point": "example:Plugin",
+                  "enabled": False,
+                  "dependencies": [],
+                  "permissions": ["network"]
+              }
+
+          def test_valid_manifest():
+              result = PluginManifestValidator().validate(valid_manifest())
+              assert result["valid"] is True
+
+          def test_invalid_permission():
+              manifest = valid_manifest()
+              manifest["permissions"] = ["system_access"]
+
+              result = PluginManifestValidator().validate(manifest)
+              assert result["valid"] is False
+
+          def test_api_compatibility():
+              result = PluginCompatibilityChecker().check(valid_manifest())
+              assert result["compatible"] is True
+
+          def test_incompatible_api():
+              manifest = valid_manifest()
+              manifest["api_version"] = "9.0"
+
+              result = PluginCompatibilityChecker().check(manifest)
+              assert result["compatible"] is False
+
+          def test_dependency_requires_approval():
+              installer = SecureDependencyInstaller(["packaging"])
+
+              result = installer.install(
+                  ["packaging==25.0"],
+                  approved=False
+              )
+
+              assert result["status"] == "APPROVAL_REQUIRED"
+              assert result["installed"] is False
+
+          def test_unapproved_dependency():
+              installer = SecureDependencyInstaller(["packaging"])
+
+              try:
+                  installer.validate(["unknown-package==1.0"])
+              except ValueError:
+                  return
+
+              assert False, "Unapproved package was accepted"
+
+          def test_approved_package_config():
+              config = json.loads(
+                  Path("config/approved-dependencies.json").read_text()
+              )
+
+              assert "packaging" in config["approved_packages"]
+          PY
+
+      - name: Install Test Dependencies
+        run: |
+          python -m pip install packaging==25.0 pytest==8.3.5
+
+      - name: Run Security Tests
+        run: |
+          python -m pytest tests/test_phase2_security.py -v
+
+      - name: Commit Security Infrastructure
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add platform_core/plugin_system/validator.py
+          git add platform_core/plugin_system/compatibility.py
+          git add platform_core/dependency_system/installer.py
+          git add config/approved-dependencies.json
+          git add tests/test_phase2_security.py
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Add Phase 2A plugin security and compatibility"
+            git push
+          fi
