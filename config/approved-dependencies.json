@@ -1,0 +1,10 @@
+{
+  "approved_packages": [
+    "packaging",
+    "httpx",
+    "pydantic",
+    "feedparser",
+    "beautifulsoup4",
+    "pytest"
+  ]
+}
