@@ -1,0 +1,307 @@
+name: Phase 2A - Extensible Core Infrastructure
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase2-core
+  cancel-in-progress: false
+
+jobs:
+  build-core:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create Core Infrastructure
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          files = {
+              "platform_core/__init__.py": "",
+              "platform_core/contracts/__init__.py": "",
+              "platform_core/plugin_system/__init__.py": "",
+              "platform_core/dependency_system/__init__.py": "",
+              "platform_core/configuration/__init__.py": "",
+              "platform_core/environment/__init__.py": "",
+
+              "platform_core/contracts/base_plugin.py": '''
+          from abc import ABC, abstractmethod
+
+          class BasePlugin(ABC):
+              name = None
+              version = None
+              api_version = "1.0"
+
+              @abstractmethod
+              def initialize(self, context):
+                  pass
+
+              @abstractmethod
+              def health_check(self):
+                  pass
+
+              @abstractmethod
+              def execute(self, task):
+                  pass
+
+              def shutdown(self):
+                  pass
+          ''',
+
+              "platform_core/plugin_system/registry.py": '''
+          import json
+          from pathlib import Path
+
+          class PluginRegistry:
+              def __init__(self, plugin_directory="plugins"):
+                  self.plugin_directory = Path(plugin_directory)
+                  self.plugins = {}
+
+              def discover(self):
+                  if not self.plugin_directory.exists():
+                      return []
+
+                  discovered = []
+
+                  for manifest in self.plugin_directory.rglob("plugin.json"):
+                      try:
+                          data = json.loads(manifest.read_text(encoding="utf-8"))
+
+                          required = ("id", "name", "version", "api_version")
+                          if not all(data.get(key) for key in required):
+                              continue
+
+                          plugin_id = data["id"]
+                          if plugin_id in self.plugins:
+                              continue
+
+                          data["_manifest_path"] = str(manifest)
+                          self.plugins[plugin_id] = data
+                          discovered.append(data)
+
+                      except (OSError, json.JSONDecodeError):
+                          continue
+
+                  return discovered
+
+              def get(self, plugin_id):
+                  return self.plugins.get(plugin_id)
+
+              def list_plugins(self):
+                  return list(self.plugins.values())
+          ''',
+
+              "platform_core/plugin_system/manager.py": '''
+          class PluginManager:
+              def __init__(self, registry):
+                  self.registry = registry
+                  self.instances = {}
+
+              def discover(self):
+                  return self.registry.discover()
+
+              def register_instance(self, plugin_id, instance):
+                  if plugin_id in self.instances:
+                      raise ValueError(f"Plugin already registered: {plugin_id}")
+
+                  self.instances[plugin_id] = instance
+
+              def health_check(self, plugin_id):
+                  plugin = self.instances.get(plugin_id)
+                  if plugin is None:
+                      return False
+                  return bool(plugin.health_check())
+
+              def shutdown_all(self):
+                  for plugin in self.instances.values():
+                      plugin.shutdown()
+          ''',
+
+              "platform_core/dependency_system/manager.py": '''
+          from importlib.metadata import version, PackageNotFoundError
+          from packaging.requirements import Requirement
+
+          class DependencyManager:
+              def inspect(self, dependencies):
+                  results = []
+
+                  for item in dependencies:
+                      requirement = Requirement(item)
+                      try:
+                          installed = version(requirement.name)
+                          satisfied = requirement.specifier.contains(
+                              installed, prereleases=True
+                          )
+                          status = "OK" if satisfied else "VERSION_MISMATCH"
+                      except PackageNotFoundError:
+                          installed = None
+                          status = "NOT_INSTALLED"
+
+                      results.append({
+                          "package": requirement.name,
+                          "required": str(requirement.specifier),
+                          "installed": installed,
+                          "status": status
+                      })
+
+                  return results
+
+              def validate_manifest(self, manifest):
+                  dependencies = manifest.get("dependencies", [])
+                  if not isinstance(dependencies, list):
+                      raise ValueError("Plugin dependencies must be a list")
+
+                  return self.inspect(dependencies)
+          ''',
+
+              "platform_core/configuration/manager.py": '''
+          import json
+          from pathlib import Path
+
+          class ConfigurationManager:
+              def __init__(self, config_path="config/platform.json"):
+                  self.config_path = Path(config_path)
+
+              def load(self):
+                  if not self.config_path.exists():
+                      return {}
+
+                  return json.loads(
+                      self.config_path.read_text(encoding="utf-8")
+                  )
+          ''',
+
+              "platform_core/environment/manager.py": '''
+          import platform
+          import sys
+          import shutil
+
+          class EnvironmentManager:
+              def inspect(self):
+                  disk = shutil.disk_usage(".")
+
+                  return {
+                      "python_version": platform.python_version(),
+                      "platform": platform.platform(),
+                      "python_executable": sys.executable,
+                      "disk_free_bytes": disk.free
+                  }
+          ''',
+
+              "config/platform.json": '''
+          {
+            "platform_name": "AI Business Pain Point Intelligence System",
+            "platform_version": "1.0.0",
+            "plugin_api_version": "1.0",
+            "plugin_directory": "plugins",
+            "dependency_installation": "manual_approval_required"
+          }
+          ''',
+
+              "plugins/README.md": '''
+          # Plugin Directory
+
+          New integrations should be added as independent plugins.
+
+          Each plugin must provide a plugin.json manifest containing:
+          - id
+          - name
+          - version
+          - api_version
+          - entry_point
+          - enabled
+          - dependencies
+
+          The core discovers manifests dynamically.
+          Plugin code must be reviewed and approved before execution.
+          ''',
+
+              "requirements-core.txt": '''
+          packaging==25.0
+          pytest==8.3.5
+          ''',
+
+              "tests/test_core.py": '''
+          import json
+          from pathlib import Path
+
+          from platform_core.plugin_system.registry import PluginRegistry
+          from platform_core.environment.manager import EnvironmentManager
+          from platform_core.configuration.manager import ConfigurationManager
+
+          def test_environment_manager():
+              result = EnvironmentManager().inspect()
+              assert "python_version" in result
+
+          def test_configuration_manager():
+              config = ConfigurationManager().load()
+              assert config["plugin_api_version"] == "1.0"
+
+          def test_plugin_discovery(tmp_path):
+              plugin_dir = tmp_path / "plugins" / "example"
+              plugin_dir.mkdir(parents=True)
+
+              manifest = {
+                  "id": "example.collector",
+                  "name": "Example Collector",
+                  "version": "1.0.0",
+                  "api_version": "1.0",
+                  "entry_point": "example:Plugin",
+                  "enabled": False,
+                  "dependencies": []
+              }
+
+              (plugin_dir / "plugin.json").write_text(json.dumps(manifest))
+
+              registry = PluginRegistry(str(tmp_path / "plugins"))
+              found = registry.discover()
+
+              assert len(found) == 1
+              assert registry.get("example.collector") is not None
+          '''
+          }
+
+          for filename, content in files.items():
+              path = Path(filename)
+              path.parent.mkdir(parents=True, exist_ok=True)
+
+              if not path.exists():
+                  path.write_text(content.lstrip(), encoding="utf-8")
+                  print(f"CREATED: {filename}")
+              else:
+                  print(f"PRESERVED: {filename}")
+          PY
+
+      - name: Install Core Dependencies
+        run: |
+          python -m pip install -r requirements-core.txt
+
+      - name: Validate Core Infrastructure
+        run: |
+          python -m pytest tests/test_core.py -v
+
+      - name: Commit Core Infrastructure
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add platform_core plugins config tests requirements-core.txt
+
+          if git diff --cached --quiet; then
+            echo "No new changes to commit."
+          else
+            git commit -m "Build Phase 2A extensible core infrastructure"
+            git push
+          fi
