@@ -31,7 +31,6 @@ jobs:
           from pathlib import Path
 
           directories = [
-              ".github/workflows",
               "deployment",
               "control_plane",
               "source_manager",
