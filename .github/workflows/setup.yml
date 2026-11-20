@@ -1,0 +1,133 @@
+name: Architecture Bootstrap
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: architecture-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create Architecture Structure
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          directories = [
+              ".github/workflows",
+              "deployment",
+              "control_plane",
+              "source_manager",
+              "collection_engine/forum_engine",
+              "collection_engine/website_engine",
+              "collection_engine/other_engine",
+              "task_queue",
+              "database",
+              "data_management",
+              "intelligence_engine",
+              "business_research",
+              "lead_qualification",
+              "lead_intelligence",
+              "outreach_engine",
+              "output_engine",
+              "learning_engine",
+              "runner_manager",
+              "infrastructure",
+              "config",
+              "tests",
+              "logs",
+          ]
+
+          for directory in directories:
+              path = Path(directory)
+              path.mkdir(parents=True, exist_ok=True)
+
+              readme = path / "README.md"
+
+              if not readme.exists():
+                  readme.write_text(
+                      f"# {path.name.replace('_', ' ').title()}\n\n"
+                      "Architecture module. Implementation pending.\n",
+                      encoding="utf-8"
+                  )
+
+          print("Architecture directories created successfully.")
+          PY
+
+      - name: Create Requirements File
+        run: |
+          if [ ! -f requirements.txt ]; then
+            cat > requirements.txt <<'EOF'
+          fastapi
+          uvicorn
+          httpx
+          pydantic
+          python-dotenv
+          gspread
+          google-auth
+          feedparser
+          praw
+          pytest
+          EOF
+          fi
+
+      - name: Validate Architecture
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          required = [
+              ".github/workflows",
+              "deployment",
+              "control_plane",
+              "collection_engine",
+              "database",
+              "intelligence_engine",
+              "business_research",
+              "lead_qualification",
+              "outreach_engine",
+              "runner_manager",
+              "tests",
+          ]
+
+          missing = [
+              item for item in required
+              if not Path(item).is_dir()
+          ]
+
+          if missing:
+              raise SystemExit(f"Missing directories: {missing}")
+
+          print("Architecture validation successful.")
+          PY
+
+      - name: Commit Architecture
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Initialize AI architecture structure"
+            git push origin HEAD:main
+          fi
