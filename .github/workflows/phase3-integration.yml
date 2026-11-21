@@ -423,7 +423,7 @@ jobs:
 
               if not path.exists():
                   path.write_text(
-                      content.strip() + "\\n",
+                      content.strip() + chr(10)
                       encoding="utf-8"
                   )
                   print("CREATED:", filename)
