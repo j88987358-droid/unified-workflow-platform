@@ -1,0 +1,638 @@
+name: Phase 3C-5 - Job Recovery System
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase3c-job-recovery
+  cancel-in-progress: false
+
+jobs:
+  job-recovery:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install pytest==8.3.5
+
+      - name: Create Recovery Controller
+        run: |
+          mkdir -p platform_core/task_queue
+
+          cat > platform_core/task_queue/recovery_controller.py <<'PY'
+          from copy import deepcopy
+          from datetime import datetime, timezone, timedelta
+
+
+          class RecoveryController:
+
+              RECOVERY_STORAGE_KEY = "task_queue:recovery_events"
+
+              def __init__(
+                  self,
+                  task_manager,
+                  lifecycle_manager,
+                  retry_controller,
+                  stale_after_seconds=900,
+                  clock=None,
+              ):
+                  if task_manager is None:
+                      raise ValueError("TaskManager is required")
+
+                  if lifecycle_manager is None:
+                      raise ValueError("LifecycleManager is required")
+
+                  if retry_controller is None:
+                      raise ValueError("RetryController is required")
+
+                  if stale_after_seconds <= 0:
+                      raise ValueError(
+                          "stale_after_seconds must be positive"
+                      )
+
+                  self.task_manager = task_manager
+                  self.lifecycle = lifecycle_manager
+                  self.retry_controller = retry_controller
+                  self.storage = task_manager.storage
+
+                  self.stale_after_seconds = stale_after_seconds
+
+                  self.clock = clock or (
+                      lambda: datetime.now(timezone.utc)
+                  )
+
+                  if self.storage.get(
+                      self.RECOVERY_STORAGE_KEY
+                  ) is None:
+                      self.storage.set(
+                          self.RECOVERY_STORAGE_KEY,
+                          [],
+                      )
+
+              def _now(self):
+                  value = self.clock()
+
+                  if value.tzinfo is None:
+                      value = value.replace(
+                          tzinfo=timezone.utc
+                      )
+
+                  return value.astimezone(timezone.utc)
+
+              def _parse_datetime(self, value):
+                  if not value:
+                      return None
+
+                  try:
+                      parsed = datetime.fromisoformat(value)
+
+                      if parsed.tzinfo is None:
+                          parsed = parsed.replace(
+                              tzinfo=timezone.utc
+                          )
+
+                      return parsed.astimezone(
+                          timezone.utc
+                      )
+
+                  except (ValueError, TypeError):
+                      return None
+
+              def _record_event(
+                  self,
+                  task_id,
+                  event_type,
+                  details=None,
+              ):
+                  events = self.storage.get(
+                      self.RECOVERY_STORAGE_KEY
+                  )
+
+                  if not isinstance(events, list):
+                      events = []
+
+                  event = {
+                      "task_id": task_id,
+                      "event_type": event_type,
+                      "timestamp": self._now().isoformat(),
+                      "details": deepcopy(details or {}),
+                  }
+
+                  events.append(event)
+
+                  self.storage.set(
+                      self.RECOVERY_STORAGE_KEY,
+                      events,
+                  )
+
+                  return event
+
+              def get_recovery_history(self, task_id=None):
+                  events = self.storage.get(
+                      self.RECOVERY_STORAGE_KEY
+                  )
+
+                  if not isinstance(events, list):
+                      return []
+
+                  if task_id is not None:
+                      events = [
+                          event for event in events
+                          if event["task_id"] == task_id
+                      ]
+
+                  return deepcopy(events)
+
+              def is_stale(self, task):
+                  if task.get("status") != "RUNNING":
+                      return False
+
+                  started_at = self._parse_datetime(
+                      task.get("started_at")
+                      or task.get("updated_at")
+                  )
+
+                  if started_at is None:
+                      return False
+
+                  age = self._now() - started_at
+
+                  return age.total_seconds() >= (
+                      self.stale_after_seconds
+                  )
+
+              def find_stale_tasks(self, limit=100):
+                  if limit < 1:
+                      raise ValueError(
+                          "limit must be positive"
+                      )
+
+                  running_tasks = self.task_manager.list_tasks(
+                      status="RUNNING"
+                  )
+
+                  stale_tasks = [
+                      task for task in running_tasks
+                      if self.is_stale(task)
+                  ]
+
+                  return stale_tasks[:limit]
+
+              def recover_task(self, task_id):
+                  task = self.task_manager.get_task(task_id)
+
+                  if task is None:
+                      raise KeyError(task_id)
+
+                  if task.get("status") != "RUNNING":
+                      return None
+
+                  if not self.is_stale(task):
+                      return None
+
+                  self._record_event(
+                      task_id,
+                      "RECOVERY_STARTED",
+                      {
+                          "previous_status": "RUNNING",
+                          "reason": "Stale running task detected",
+                      },
+                  )
+
+                  self.lifecycle.mark_failed(
+                      task_id,
+                      details={
+                          "reason": "Interrupted execution",
+                          "recovery": True,
+                      },
+                  )
+
+                  result = self.retry_controller.handle_failure(
+                      task_id,
+                      error="Task interrupted by runner shutdown",
+                  )
+
+                  self._record_event(
+                      task_id,
+                      "RECOVERY_COMPLETED",
+                      {
+                          "new_status": result["status"],
+                          "retry_count": result.get(
+                              "retry_count", 0
+                          ),
+                      },
+                  )
+
+                  return result
+
+              def recover_stale_tasks(self, limit=100):
+                  stale_tasks = self.find_stale_tasks(
+                      limit=limit
+                  )
+
+                  results = []
+
+                  for task in stale_tasks:
+                      result = self.recover_task(
+                          task["task_id"]
+                      )
+
+                      if result is not None:
+                          results.append(result)
+
+                  return results
+
+              def recovery_report(self):
+                  events = self.get_recovery_history()
+
+                  completed = [
+                      event for event in events
+                      if event["event_type"] == "RECOVERY_COMPLETED"
+                  ]
+
+                  retry_count = sum(
+                      1 for event in completed
+                      if event["details"].get("new_status") == "RETRY"
+                  )
+
+                  dead_letter_count = sum(
+                      1 for event in completed
+                      if event["details"].get("new_status")
+                    == "DEAD_LETTER"
+                  )
+
+                  return {
+                      "total_recoveries": len(completed),
+                      "retry_scheduled": retry_count,
+                      "dead_letter": dead_letter_count,
+                      "recovery_events": len(events),
+                  }
+          PY
+
+      - name: Create Recovery Tests
+        run: |
+          mkdir -p tests
+
+          cat > tests/test_phase3c_job_recovery.py <<'PY'
+          from datetime import datetime, timezone, timedelta
+
+          import pytest
+
+          from platform_core.storage.memory_storage import (
+              InMemoryStorage,
+          )
+
+          from platform_core.task_queue.persistent_task_manager import (
+              PersistentTaskManager,
+          )
+
+          from platform_core.task_queue.task_lifecycle_manager import (
+              TaskLifecycleManager,
+          )
+
+          from platform_core.task_queue.retry_controller import (
+              RetryController,
+          )
+
+          from platform_core.task_queue.recovery_controller import (
+              RecoveryController,
+          )
+
+
+          class FakeClock:
+
+              def __init__(self):
+                  self.current = datetime(
+                      2026, 1, 1, 12, 0, 0,
+                      tzinfo=timezone.utc,
+                  )
+
+              def __call__(self):
+                  return self.current
+
+              def advance(self, seconds):
+                  self.current += timedelta(seconds=seconds)
+
+
+          @pytest.fixture
+          def setup():
+              storage = InMemoryStorage()
+
+              manager = PersistentTaskManager(storage)
+
+              lifecycle = TaskLifecycleManager(manager)
+
+              clock = FakeClock()
+
+              retry = RetryController(
+                  manager,
+                  max_retries=3,
+                  base_delay_seconds=60,
+                  max_delay_seconds=3600,
+                  clock=clock,
+              )
+
+              recovery = RecoveryController(
+                  manager,
+                  lifecycle,
+                  retry,
+                  stale_after_seconds=300,
+                  clock=clock,
+              )
+
+              return (
+                  storage,
+                  manager,
+                  lifecycle,
+                  retry,
+                  recovery,
+                  clock,
+              )
+
+
+          def make_running_task(manager, lifecycle):
+              task = manager.create_task("example.worker")
+
+              lifecycle.mark_running(task["task_id"])
+
+              return task["task_id"]
+
+
+          def make_stale(manager, task_id, clock, seconds=600):
+              data = manager.storage.get(
+                  manager.STORAGE_KEY
+              )
+
+              old_time = (
+                  clock.current - timedelta(seconds=seconds)
+              ).isoformat()
+
+              data["tasks"][task_id]["started_at"] = old_time
+
+              manager.storage.set(
+                  manager.STORAGE_KEY,
+                  data,
+              )
+
+
+          def test_fresh_running_task_is_not_stale(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              task_id = make_running_task(manager, lifecycle)
+
+              assert recovery.is_stale(
+                  manager.get_task(task_id)
+              ) is False
+
+
+          def test_old_running_task_is_stale(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              task_id = make_running_task(manager, lifecycle)
+
+              make_stale(manager, task_id, clock)
+
+              assert recovery.is_stale(
+                  manager.get_task(task_id)
+              ) is True
+
+
+          def test_stale_task_is_detected(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              task_id = make_running_task(manager, lifecycle)
+
+              make_stale(manager, task_id, clock)
+
+              tasks = recovery.find_stale_tasks()
+
+              assert len(tasks) == 1
+              assert tasks[0]["task_id"] == task_id
+
+
+          def test_stale_task_is_recovered(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              task_id = make_running_task(manager, lifecycle)
+
+              make_stale(manager, task_id, clock)
+
+              result = recovery.recover_task(task_id)
+
+              assert result["status"] == "RETRY"
+              assert result["retry_count"] == 1
+
+
+          def test_fresh_task_is_not_recovered(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              task_id = make_running_task(manager, lifecycle)
+
+              result = recovery.recover_task(task_id)
+
+              assert result is None
+
+              assert manager.get_task(
+                  task_id
+              )["status"] == "RUNNING"
+
+
+          def test_recovery_history_is_saved(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              task_id = make_running_task(manager, lifecycle)
+
+              make_stale(manager, task_id, clock)
+
+              recovery.recover_task(task_id)
+
+              history = recovery.get_recovery_history(
+                  task_id
+              )
+
+              event_types = [
+                  event["event_type"]
+                  for event in history
+              ]
+
+              assert "RECOVERY_STARTED" in event_types
+              assert "RECOVERY_COMPLETED" in event_types
+
+
+          def test_recovery_report(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              task_id = make_running_task(manager, lifecycle)
+
+              make_stale(manager, task_id, clock)
+
+              recovery.recover_task(task_id)
+
+              report = recovery.recovery_report()
+
+              assert report["total_recoveries"] == 1
+              assert report["retry_scheduled"] == 1
+
+
+          def test_max_retry_task_goes_to_dead_letter(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              task_id = make_running_task(manager, lifecycle)
+
+              data = storage.get(manager.STORAGE_KEY)
+
+              data["tasks"][task_id]["retry_count"] = 3
+
+              storage.set(manager.STORAGE_KEY, data)
+
+              make_stale(manager, task_id, clock)
+
+              result = recovery.recover_task(task_id)
+
+              assert result["status"] == "DEAD_LETTER"
+
+
+          def test_multiple_stale_tasks_recovered(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              ids = []
+
+              for _ in range(3):
+                  task_id = make_running_task(
+                      manager,
+                      lifecycle,
+                  )
+
+                  make_stale(manager, task_id, clock)
+
+                  ids.append(task_id)
+
+              results = recovery.recover_stale_tasks()
+
+              assert len(results) == 3
+
+              assert all(
+                  task["status"] == "RETRY"
+                  for task in results
+              )
+
+
+          def test_recovery_limit(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              for _ in range(3):
+                  task_id = make_running_task(
+                      manager,
+                      lifecycle,
+                  )
+
+                  make_stale(manager, task_id, clock)
+
+              results = recovery.recover_stale_tasks(
+                  limit=2
+              )
+
+              assert len(results) == 2
+
+
+          def test_already_recovered_task_is_ignored(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              task_id = make_running_task(manager, lifecycle)
+
+              make_stale(manager, task_id, clock)
+
+              first = recovery.recover_task(task_id)
+
+              second = recovery.recover_task(task_id)
+
+              assert first["status"] == "RETRY"
+              assert second is None
+
+
+          def test_missing_task_raises_error(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              with pytest.raises(KeyError):
+                  recovery.recover_task("missing-task")
+
+
+          def test_invalid_recovery_limit(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              with pytest.raises(ValueError):
+                  recovery.find_stale_tasks(limit=0)
+
+
+          def test_invalid_stale_timeout(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              with pytest.raises(ValueError):
+                  RecoveryController(
+                      manager,
+                      lifecycle,
+                      retry,
+                      stale_after_seconds=0,
+                  )
+
+
+          def test_non_running_task_is_ignored(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              task = manager.create_task("example.worker")
+
+              assert recovery.recover_task(
+                  task["task_id"]
+              ) is None
+
+
+          def test_recovery_events_are_persisted_in_storage(setup):
+              storage, manager, lifecycle, retry, recovery, clock = setup
+
+              task_id = make_running_task(manager, lifecycle)
+
+              make_stale(manager, task_id, clock)
+
+              recovery.recover_task(task_id)
+
+              events = storage.get(
+                  RecoveryController.RECOVERY_STORAGE_KEY
+              )
+
+              assert len(events) == 2
+          PY
+
+      - name: Run Recovery Tests
+        run: |
+          python -m pytest tests/test_phase3c_job_recovery.py -v
+
+      - name: Compile Python Files
+        run: |
+          python -m compileall -q platform_core tests
+
+      - name: Commit Phase 3C-5
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add platform_core/task_queue/recovery_controller.py
+          git add tests/test_phase3c_job_recovery.py
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Add Phase 3C-5 job recovery system"
+            git push
+          fi
