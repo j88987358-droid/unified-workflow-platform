@@ -1,0 +1,594 @@
+name: Phase 3C-4 - Worker Execution Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase3c-worker-execution
+  cancel-in-progress: false
+
+jobs:
+  worker-execution:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install pytest==8.3.5
+
+      - name: Create Worker Execution Engine
+        run: |
+          mkdir -p platform_core/execution
+
+          cat > platform_core/execution/__init__.py <<'PY'
+          from .execution_engine import ExecutionEngine
+
+          __all__ = ["ExecutionEngine"]
+          PY
+
+          cat > platform_core/execution/execution_engine.py <<'PY'
+          class ExecutionEngine:
+
+              def __init__(
+                  self,
+                  task_manager,
+                  lifecycle_manager,
+                  retry_controller,
+                  worker_manager,
+              ):
+                  if task_manager is None:
+                      raise ValueError("TaskManager required")
+
+                  if lifecycle_manager is None:
+                      raise ValueError("LifecycleManager required")
+
+                  if retry_controller is None:
+                      raise ValueError("RetryController required")
+
+                  if worker_manager is None:
+                      raise ValueError("WorkerManager required")
+
+                  self.task_manager = task_manager
+                  self.lifecycle = lifecycle_manager
+                  self.retry_controller = retry_controller
+                  self.worker_manager = worker_manager
+
+              def _get_worker_id(self, task):
+                  payload = task.get("payload") or {}
+
+                  worker_id = payload.get("worker_id")
+
+                  if not worker_id:
+                      worker_id = task.get("task_type")
+
+                  if not worker_id:
+                      raise ValueError("Task has no worker_id")
+
+                  return worker_id
+
+              def _ensure_worker_ready(self, worker_id):
+                  if worker_id not in self.worker_manager.workers:
+                      raise KeyError(
+                          f"Worker not registered: {worker_id}"
+                      )
+
+                  status = self.worker_manager.status.get(
+                      worker_id
+                  )
+
+                  if status != "READY":
+                      self.worker_manager.start(worker_id)
+
+                  if not self.worker_manager.health_check(
+                      worker_id
+                  ):
+                      raise RuntimeError(
+                          f"Worker unhealthy: {worker_id}"
+                      )
+
+              def _execute_running_task(self, task):
+                  task_id = task["task_id"]
+
+                  try:
+                      worker_id = self._get_worker_id(task)
+
+                      self._ensure_worker_ready(worker_id)
+
+                      result = self.worker_manager.execute(
+                          worker_id,
+                          task,
+                      )
+
+                      return self.lifecycle.mark_success(
+                          task_id,
+                          details={
+                              "result": result,
+                          },
+                      )
+
+                  except Exception as exc:
+                      current = self.task_manager.get_task(
+                          task_id
+                      )
+
+                      if current["status"] != "RUNNING":
+                          raise
+
+                      self.lifecycle.mark_failed(
+                          task_id,
+                          details={
+                              "error": str(exc),
+                          },
+                      )
+
+                      return self.retry_controller.handle_failure(
+                          task_id,
+                          error=str(exc),
+                      )
+
+              def execute_task(self, task_id):
+                  task = self.task_manager.get_task(task_id)
+
+                  if task is None:
+                      raise KeyError(task_id)
+
+                  if task["status"] == "PENDING":
+                      task = self.lifecycle.mark_running(
+                          task_id
+                      )
+
+                  elif task["status"] != "RUNNING":
+                      raise ValueError(
+                          f"Task cannot execute from status "
+                          f"{task['status']}"
+                      )
+
+                  return self._execute_running_task(task)
+
+              def process_pending_tasks(self, max_tasks=100):
+                  if max_tasks < 1:
+                      raise ValueError(
+                          "max_tasks must be positive"
+                      )
+
+                  results = []
+
+                  for _ in range(max_tasks):
+                      task = self.task_manager.get_next_pending_task()
+
+                      if task is None:
+                          break
+
+                      result = self.execute_task(
+                          task["task_id"]
+                      )
+
+                      results.append(result)
+
+                  return results
+
+              def process_due_retries(self):
+                  due_tasks = (
+                      self.retry_controller.process_due_retries()
+                  )
+
+                  results = []
+
+                  for task in due_tasks:
+                      result = self._execute_running_task(task)
+                      results.append(result)
+
+                  return results
+
+              def run_once(self, max_tasks=100):
+                  return {
+                      "pending_results": self.process_pending_tasks(
+                          max_tasks=max_tasks
+                      ),
+                      "retry_results": self.process_due_retries(),
+                  }
+          PY
+
+      - name: Create Worker Execution Integration Tests
+        run: |
+          mkdir -p tests
+
+          cat > tests/test_phase3c_worker_execution.py <<'PY'
+          from datetime import datetime, timezone
+
+          import pytest
+
+          from platform_core.storage.memory_storage import (
+              InMemoryStorage,
+          )
+
+          from platform_core.task_queue.persistent_task_manager import (
+              PersistentTaskManager,
+          )
+
+          from platform_core.task_queue.task_lifecycle_manager import (
+              TaskLifecycleManager,
+          )
+
+          from platform_core.task_queue.retry_controller import (
+              RetryController,
+          )
+
+          from platform_core.plugin_system.worker_manager import (
+              WorkerManager,
+          )
+
+          from platform_core.contracts.base_worker import BaseWorker
+
+          from platform_core.execution.execution_engine import (
+              ExecutionEngine,
+          )
+
+
+          class FakeClock:
+
+              def __init__(self):
+                  self.current = datetime(
+                      2026, 1, 1, 12, 0, 0,
+                      tzinfo=timezone.utc,
+                  )
+
+              def __call__(self):
+                  return self.current
+
+
+          class DemoWorker(BaseWorker):
+
+              name = "demo.worker"
+
+              def initialize(self, context):
+                  self.initialized = True
+
+              def execute(self, task):
+                  return {
+                      "message": "Task executed",
+                      "task_id": task["task_id"],
+                  }
+
+              def health_check(self):
+                  return True
+
+
+          class FailingWorker(BaseWorker):
+
+              name = "failing.worker"
+
+              def initialize(self, context):
+                  self.initialized = True
+
+              def execute(self, task):
+                  raise RuntimeError("Temporary worker failure")
+
+              def health_check(self):
+                  return True
+
+
+          @pytest.fixture
+          def setup():
+              storage = InMemoryStorage()
+
+              task_manager = PersistentTaskManager(storage)
+
+              lifecycle = TaskLifecycleManager(task_manager)
+
+              clock = FakeClock()
+
+              retry = RetryController(
+                  task_manager,
+                  max_retries=3,
+                  base_delay_seconds=60,
+                  max_delay_seconds=3600,
+                  clock=clock,
+              )
+
+              worker_manager = WorkerManager()
+
+              worker_manager.register(
+                  "demo.worker",
+                  DemoWorker(),
+              )
+
+              worker_manager.register(
+                  "failing.worker",
+                  FailingWorker(),
+              )
+
+              engine = ExecutionEngine(
+                  task_manager,
+                  lifecycle,
+                  retry,
+                  worker_manager,
+              )
+
+              return (
+                  task_manager,
+                  lifecycle,
+                  retry,
+                  worker_manager,
+                  engine,
+              )
+
+
+          def test_successful_worker_execution(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              task = manager.create_task(
+                  "demo.worker",
+                  payload={
+                      "worker_id": "demo.worker",
+                  },
+              )
+
+              result = engine.execute_task(task["task_id"])
+
+              assert result["status"] == "SUCCESS"
+
+
+          def test_worker_is_started_automatically(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              task = manager.create_task(
+                  "demo.worker",
+                  payload={
+                      "worker_id": "demo.worker",
+                  },
+              )
+
+              engine.execute_task(task["task_id"])
+
+              assert workers.status["demo.worker"] == "READY"
+
+
+          def test_success_result_is_saved(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              task = manager.create_task(
+                  "demo.worker",
+                  payload={
+                      "worker_id": "demo.worker",
+                  },
+              )
+
+              result = engine.execute_task(task["task_id"])
+
+              history = lifecycle.get_history(task["task_id"])
+
+              assert result["status"] == "SUCCESS"
+
+              assert history[-1]["to_status"] == "SUCCESS"
+
+
+          def test_worker_failure_schedules_retry(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              task = manager.create_task(
+                  "failing.worker",
+                  payload={
+                      "worker_id": "failing.worker",
+                  },
+              )
+
+              result = engine.execute_task(task["task_id"])
+
+              assert result["status"] == "RETRY"
+
+              assert result["retry_count"] == 1
+
+
+          def test_retry_metadata_saved_after_failure(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              task = manager.create_task(
+                  "failing.worker",
+                  payload={
+                      "worker_id": "failing.worker",
+                  },
+              )
+
+              result = engine.execute_task(task["task_id"])
+
+              assert result["last_error"] is not None
+
+              assert result["next_retry_at"] is not None
+
+
+          def test_retry_worker_execution(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              task = manager.create_task(
+                  "demo.worker",
+                  payload={
+                      "worker_id": "demo.worker",
+                  },
+              )
+
+              lifecycle.mark_running(task["task_id"])
+
+              lifecycle.mark_failed(
+                  task["task_id"],
+                  "Temporary failure",
+              )
+
+              retry.handle_failure(task["task_id"])
+
+              retry.clock.current = (
+                  datetime(2026, 1, 1, 12, 2, 0,
+                           tzinfo=timezone.utc)
+              )
+
+              results = engine.process_due_retries()
+
+              assert len(results) == 1
+
+              assert results[0]["status"] == "SUCCESS"
+
+
+          def test_retry_worker_failure_is_rescheduled(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              task = manager.create_task(
+                  "failing.worker",
+                  payload={
+                      "worker_id": "failing.worker",
+                  },
+              )
+
+              engine.execute_task(task["task_id"])
+
+              retry.clock.current = (
+                  datetime(2026, 1, 1, 12, 2, 0,
+                           tzinfo=timezone.utc)
+              )
+
+              results = engine.process_due_retries()
+
+              assert len(results) == 1
+
+              assert results[0]["status"] == "RETRY"
+
+              assert results[0]["retry_count"] == 2
+
+
+          def test_unknown_worker_goes_to_retry(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              task = manager.create_task(
+                  "unknown.worker",
+                  payload={
+                      "worker_id": "unknown.worker",
+                  },
+              )
+
+              result = engine.execute_task(task["task_id"])
+
+              assert result["status"] == "RETRY"
+
+
+          def test_missing_task_raises_error(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              with pytest.raises(KeyError):
+                  engine.execute_task("missing-task")
+
+
+          def test_pending_queue_processing(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              manager.create_task(
+                  "demo.worker",
+                  payload={
+                      "worker_id": "demo.worker",
+                  },
+              )
+
+              manager.create_task(
+                  "demo.worker",
+                  payload={
+                      "worker_id": "demo.worker",
+                  },
+              )
+
+              results = engine.process_pending_tasks()
+
+              assert len(results) == 2
+
+              assert all(
+                  task["status"] == "SUCCESS"
+                  for task in results
+              )
+
+
+          def test_max_task_limit(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              for _ in range(3):
+                  manager.create_task(
+                      "demo.worker",
+                      payload={
+                          "worker_id": "demo.worker",
+                      },
+                  )
+
+              results = engine.process_pending_tasks(
+                  max_tasks=2
+              )
+
+              assert len(results) == 2
+
+
+          def test_invalid_max_task_limit(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              with pytest.raises(ValueError):
+                  engine.process_pending_tasks(max_tasks=0)
+
+
+          def test_worker_failure_does_not_mark_success(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              task = manager.create_task(
+                  "failing.worker",
+                  payload={
+                      "worker_id": "failing.worker",
+                  },
+              )
+
+              result = engine.execute_task(task["task_id"])
+
+              assert result["status"] != "SUCCESS"
+
+
+          def test_successful_tasks_are_removed_from_pending(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              task = manager.create_task(
+                  "demo.worker",
+                  payload={
+                      "worker_id": "demo.worker",
+                  },
+              )
+
+              engine.execute_task(task["task_id"])
+
+              assert manager.get_next_pending_task() is None
+          PY
+
+      - name: Run Phase 3C-4 Tests
+        run: |
+          python -m pytest tests/test_phase3c_worker_execution.py -v
+
+      - name: Compile Python Files
+        run: |
+          python -m compileall -q platform_core tests
+
+      - name: Commit Phase 3C-4
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add platform_core/execution/__init__.py
+          git add platform_core/execution/execution_engine.py
+          git add tests/test_phase3c_worker_execution.py
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Add Phase 3C-4 worker execution integration"
+            git push
+          fi
