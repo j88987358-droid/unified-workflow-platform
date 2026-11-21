@@ -1,0 +1,311 @@
+name: Phase 3B-4 - End-to-End Execution Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase3b-execution-integration
+  cancel-in-progress: false
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Test Dependencies
+        run: |
+          python -m pip install pytest==8.3.5 packaging==25.0
+
+      - name: Create End-to-End Integration Tests
+        run: |
+          mkdir -p tests
+
+          cat > tests/test_phase3b_execution_integration.py <<'PY'
+          import json
+          from pathlib import Path
+
+          import pytest
+
+          from platform_core.runtime import ArchitectureRuntime
+          from platform_core.plugin_system.auto_registrar import AutomaticRegistrar
+
+
+          def create_test_environment(root):
+
+              plugin_dir = root / "plugins"
+              worker_dir = plugin_dir / "workers"
+
+              example_plugin = plugin_dir / "example_plugin"
+              example_worker = worker_dir / "example_worker"
+
+              example_plugin.mkdir(parents=True)
+              example_worker.mkdir(parents=True)
+
+              plugin_manifest = {
+                  "id": "integration.example_plugin",
+                  "name": "Integration Example Plugin",
+                  "version": "1.0.0",
+                  "api_version": "1.0",
+                  "entry_point": "main:ExamplePlugin",
+                  "enabled": True,
+                  "dependencies": [],
+                  "permissions": ["logging"]
+              }
+
+              worker_manifest = {
+                  "id": "integration.example_worker",
+                  "name": "Integration Example Worker",
+                  "version": "1.0.0",
+                  "api_version": "1.0",
+                  "entry_point": "main:ExampleWorker",
+                  "enabled": True,
+                  "dependencies": []
+              }
+
+              (example_plugin / "plugin.json").write_text(
+                  json.dumps(plugin_manifest),
+                  encoding="utf-8"
+              )
+
+              (example_worker / "worker.json").write_text(
+                  json.dumps(worker_manifest),
+                  encoding="utf-8"
+              )
+
+              plugin_code = "\n".join([
+                  "from platform_core.contracts.base_plugin import BasePlugin",
+                  "",
+                  "class ExamplePlugin(BasePlugin):",
+                  "    name = 'Integration Example Plugin'",
+                  "    version = '1.0.0'",
+                  "",
+                  "    def initialize(self, context):",
+                  "        self.initialized = True",
+                  "",
+                  "    def health_check(self):",
+                  "        return getattr(self, 'initialized', False)",
+                  "",
+                  "    def execute(self, task):",
+                  "        return {'plugin': 'success'}",
+                  ""
+              ])
+
+              worker_code = "\n".join([
+                  "from platform_core.contracts.base_worker import BaseWorker",
+                  "",
+                  "class ExampleWorker(BaseWorker):",
+                  "    name = 'Integration Example Worker'",
+                  "    version = '1.0.0'",
+                  "",
+                  "    def initialize(self, context):",
+                  "        self.initialized = True",
+                  "",
+                  "    def execute(self, task):",
+                  "        return {",
+                  "            'status': 'success',",
+                  "            'value': task.get('value'),",
+                  "            'processed_by': 'integration.example_worker'",
+                  "        }",
+                  "",
+                  "    def health_check(self):",
+                  "        return getattr(self, 'initialized', False)",
+                  ""
+              ])
+
+              (example_plugin / "main.py").write_text(
+                  plugin_code,
+                  encoding="utf-8"
+              )
+
+              (example_worker / "main.py").write_text(
+                  worker_code,
+                  encoding="utf-8"
+              )
+
+              approval_file = root / "approvals.json"
+
+              approval_file.write_text(
+                  json.dumps({
+                      "approved_plugin_ids": [
+                          "integration.example_plugin"
+                      ],
+                      "approved_worker_ids": [
+                          "integration.example_worker"
+                      ]
+                  }),
+                  encoding="utf-8"
+              )
+
+              return plugin_dir, worker_dir, approval_file
+
+
+          @pytest.fixture
+          def integrated_system(tmp_path):
+
+              plugin_dir, worker_dir, approval_file = (
+                  create_test_environment(tmp_path)
+              )
+
+              runtime = ArchitectureRuntime()
+              runtime.initialize()
+
+              registrar = AutomaticRegistrar(
+                  runtime=runtime,
+                  plugin_directory=str(plugin_dir),
+                  worker_directory=str(worker_dir),
+                  approval_file=str(approval_file)
+              )
+
+              try:
+                  yield runtime, registrar
+              finally:
+                  registrar.shutdown()
+                  runtime.shutdown()
+
+
+          def test_plugin_and_worker_discovery(integrated_system):
+
+              runtime, registrar = integrated_system
+
+              report = registrar.register_all()
+
+              assert report["plugin_count"] == 1
+              assert report["worker_count"] == 1
+              assert report["error_count"] == 0
+
+
+          def test_plugin_registration_and_health(integrated_system):
+
+              runtime, registrar = integrated_system
+
+              registrar.register_all()
+
+              assert registrar.plugin_manager.health_check(
+                  "integration.example_plugin"
+              ) is True
+
+
+          def test_worker_registration_and_health(integrated_system):
+
+              runtime, registrar = integrated_system
+
+              registrar.register_all()
+
+              assert runtime.worker_manager.health_check(
+                  "integration.example_worker"
+              ) is True
+
+
+          def test_end_to_end_task_execution(integrated_system):
+
+              runtime, registrar = integrated_system
+
+              registrar.register_all()
+
+              task = runtime.submit_task(
+                  "integration.example_worker",
+                  {"value": 123},
+                  priority=1
+              )
+
+              result = runtime.execute_task(
+                  task["task_id"]
+              )
+
+              assert result["status"] == "SUCCESS"
+
+              assert result["result"]["status"] == "success"
+
+              assert result["result"]["value"] == 123
+
+              assert (
+                  result["result"]["processed_by"]
+                  == "integration.example_worker"
+              )
+
+
+          def test_task_status_after_execution(integrated_system):
+
+              runtime, registrar = integrated_system
+
+              registrar.register_all()
+
+              task = runtime.submit_task(
+                  "integration.example_worker",
+                  {"value": 456}
+              )
+
+              result = runtime.execute_task(task["task_id"])
+
+              saved_task = runtime.task_manager.get_task(
+                  task["task_id"]
+              )
+
+              assert result["status"] == "SUCCESS"
+              assert saved_task["status"] == "SUCCESS"
+
+
+          def test_runtime_metrics(integrated_system):
+
+              runtime, registrar = integrated_system
+
+              registrar.register_all()
+
+              task = runtime.submit_task(
+                  "integration.example_worker",
+                  {"value": 789}
+              )
+
+              runtime.execute_task(task["task_id"])
+
+              assert runtime.metrics["tasks_completed"] == 1
+              assert runtime.metrics["tasks_failed"] == 0
+
+
+          def test_worker_health_monitoring(integrated_system):
+
+              runtime, registrar = integrated_system
+
+              registrar.register_all()
+
+              report = runtime.health_report()
+
+              assert any(
+                  item["name"] == "worker:integration.example_worker"
+                  and item["status"] == "HEALTHY"
+                  for item in report
+              )
+          PY
+
+      - name: Run End-to-End Tests
+        run: |
+          python -m pytest tests/test_phase3b_execution_integration.py -v
+
+      - name: Compile Python Files
+        run: |
+          python -m compileall -q platform_core tests
+
+      - name: Commit Integration Tests
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add tests/test_phase3b_execution_integration.py
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Add Phase 3B end-to-end execution integration tests"
+            git push
+          fi
