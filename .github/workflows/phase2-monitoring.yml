@@ -1,0 +1,464 @@
+name: Phase 2D - Monitoring and Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase2-monitoring
+  cancel-in-progress: false
+
+jobs:
+  build-monitoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest==8.3.5 packaging==25.0
+
+      - name: Create Monitoring Infrastructure
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          files = {
+
+          "platform_core/monitoring/__init__.py": '''
+          from .health_monitor import HealthMonitor
+          from .system_reporter import SystemReporter
+
+          __all__ = ["HealthMonitor", "SystemReporter"]
+          ''',
+
+          "platform_core/monitoring/health_monitor.py": '''
+          from datetime import datetime, timezone
+
+          class HealthMonitor:
+
+              def __init__(self):
+                  self.components = {}
+
+              def register(self, name, component):
+                  self.components[name] = component
+
+              def check(self, name):
+                  if name not in self.components:
+                      return {
+                          "name": name,
+                          "status": "UNKNOWN",
+                          "checked_at": datetime.now(
+                              timezone.utc
+                          ).isoformat(),
+                      }
+
+                  component = self.components[name]
+
+                  try:
+                      if hasattr(component, "health_check"):
+                          result = component.health_check()
+                      elif hasattr(component, "status"):
+                          result = component.status
+                      else:
+                          result = "REGISTERED"
+
+                      healthy = (
+                          result is True
+                          or result == "HEALTHY"
+                          or result == "REGISTERED"
+                          or (
+                              isinstance(result, dict)
+                              and result.get("healthy") is True
+                          )
+                      )
+
+                      return {
+                          "name": name,
+                          "status": "HEALTHY" if healthy else "UNHEALTHY",
+                          "details": result,
+                          "checked_at": datetime.now(
+                              timezone.utc
+                          ).isoformat(),
+                      }
+
+                  except Exception as exc:
+                      return {
+                          "name": name,
+                          "status": "ERROR",
+                          "error": str(exc),
+                          "checked_at": datetime.now(
+                              timezone.utc
+                          ).isoformat(),
+                      }
+
+              def check_all(self):
+                  return [
+                      self.check(name)
+                      for name in self.components
+                  ]
+          ''',
+
+          "platform_core/monitoring/system_reporter.py": '''
+          from datetime import datetime, timezone
+
+          class SystemReporter:
+
+              def generate(self, health_results):
+                  total = len(health_results)
+
+                  healthy = sum(
+                      item["status"] == "HEALTHY"
+                      for item in health_results
+                  )
+
+                  unhealthy = sum(
+                      item["status"] == "UNHEALTHY"
+                      for item in health_results
+                  )
+
+                  errors = sum(
+                      item["status"] == "ERROR"
+                      for item in health_results
+                  )
+
+                  unknown = total - healthy - unhealthy - errors
+
+                  return {
+                      "generated_at": datetime.now(
+                          timezone.utc
+                      ).isoformat(),
+                      "total_components": total,
+                      "healthy": healthy,
+                      "unhealthy": unhealthy,
+                      "errors": errors,
+                      "unknown": unknown,
+                      "overall_status": (
+                          "HEALTHY"
+                          if total > 0 and healthy == total
+                          else "DEGRADED"
+                      ),
+                      "components": health_results,
+                  }
+          ''',
+
+          "platform_core/validation/__init__.py": '''
+          from .dependency_validator import DependencyValidator
+          from .plugin_validator import PluginValidator
+
+          __all__ = ["DependencyValidator", "PluginValidator"]
+          ''',
+
+          "platform_core/validation/dependency_validator.py": '''
+          from importlib.metadata import (
+              PackageNotFoundError,
+              version,
+          )
+          from packaging.specifiers import SpecifierSet
+          from packaging.version import Version
+
+          class DependencyValidator:
+
+              def validate(self, dependencies):
+                  results = []
+
+                  for name, required in dependencies.items():
+                      try:
+                          installed = version(name)
+
+                          compatible = (
+                              not required
+                              or Version(installed) in
+                              SpecifierSet(required)
+                          )
+
+                          results.append({
+                              "package": name,
+                              "installed_version": installed,
+                              "required_version": required,
+                              "status": (
+                                  "COMPATIBLE"
+                                  if compatible
+                                  else "INCOMPATIBLE"
+                              ),
+                          })
+
+                      except PackageNotFoundError:
+                          results.append({
+                              "package": name,
+                              "required_version": required,
+                              "status": "MISSING",
+                          })
+
+                      except Exception as exc:
+                          results.append({
+                              "package": name,
+                              "status": "ERROR",
+                              "error": str(exc),
+                          })
+
+                  return {
+                      "valid": all(
+                          item["status"] == "COMPATIBLE"
+                          for item in results
+                      ),
+                      "results": results,
+                  }
+          ''',
+
+          "platform_core/validation/plugin_validator.py": '''
+          import json
+          import re
+          from pathlib import Path
+
+          class PluginValidator:
+
+              REQUIRED_FIELDS = {
+                  "id",
+                  "name",
+                  "version",
+                  "api_version",
+                  "enabled",
+              }
+
+              def validate_data(self, data):
+                  errors = []
+
+                  missing = self.REQUIRED_FIELDS - set(data)
+
+                  if missing:
+                      errors.append(
+                          f"Missing fields: {sorted(missing)}"
+                      )
+
+                  plugin_id = data.get("id")
+
+                  if plugin_id is not None:
+                      if not isinstance(plugin_id, str) or not re.fullmatch(
+                          r"[a-z0-9][a-z0-9_-]*",
+                          plugin_id
+                      ):
+                          errors.append("Invalid plugin id")
+
+                  if not isinstance(data.get("enabled"), bool):
+                      errors.append("enabled must be boolean")
+
+                  for field in (
+                      "name",
+                      "version",
+                      "api_version"
+                  ):
+                      if field in data and not isinstance(
+                          data[field], str
+                      ):
+                          errors.append(
+                              f"{field} must be a string"
+                          )
+
+                  for field in ("dependencies", "permissions"):
+                      if field in data and not isinstance(
+                          data[field], list
+                      ):
+                          errors.append(
+                              f"{field} must be a list"
+                          )
+
+                  return {
+                      "valid": not errors,
+                      "errors": errors,
+                  }
+
+              def validate_file(self, filepath):
+                  path = Path(filepath)
+
+                  try:
+                      data = json.loads(
+                          path.read_text(encoding="utf-8")
+                      )
+
+                      return self.validate_data(data)
+
+                  except Exception as exc:
+                      return {
+                          "valid": False,
+                          "errors": [str(exc)],
+                      }
+          ''',
+
+          "platform_core/monitoring/test_manager.py": '''
+          import subprocess
+          import sys
+
+          class TestManager:
+
+              def run(self, test_path="tests"):
+                  result = subprocess.run(
+                      [
+                          sys.executable,
+                          "-m",
+                          "pytest",
+                          test_path,
+                          "-v",
+                      ],
+                      capture_output=True,
+                      text=True,
+                      check=False,
+                  )
+
+                  return {
+                      "success": result.returncode == 0,
+                      "return_code": result.returncode,
+                      "stdout": result.stdout,
+                      "stderr": result.stderr,
+                  }
+          ''',
+
+          "platform_core/monitoring/recovery_integration.py": '''
+          class RecoveryIntegration:
+
+              def __init__(self, recovery_manager):
+                  self.recovery_manager = recovery_manager
+
+              def recover_component(self, checkpoint_name):
+                  return self.recovery_manager.recover(
+                      checkpoint_name
+                  )
+          ''',
+
+          "tests/test_phase2_monitoring.py": '''
+          import json
+
+          from platform_core.monitoring.health_monitor import HealthMonitor
+          from platform_core.monitoring.system_reporter import SystemReporter
+          from platform_core.validation.plugin_validator import PluginValidator
+          from platform_core.validation.dependency_validator import DependencyValidator
+
+          def test_health_monitor():
+              monitor = HealthMonitor()
+              monitor.register("database", lambda: True)
+
+              class Healthy:
+                  def health_check(self):
+                      return True
+
+              monitor.register("worker", Healthy())
+
+              results = monitor.check_all()
+
+              assert len(results) == 2
+              assert results[1]["status"] == "HEALTHY"
+
+          def test_unknown_component():
+              monitor = HealthMonitor()
+              assert monitor.check("missing")["status"] == "UNKNOWN"
+
+          def test_system_reporter():
+              reporter = SystemReporter()
+
+              report = reporter.generate([
+                  {"name": "database", "status": "HEALTHY"},
+                  {"name": "worker", "status": "HEALTHY"},
+              ])
+
+              assert report["overall_status"] == "HEALTHY"
+              assert report["healthy"] == 2
+
+          def test_degraded_report():
+              report = SystemReporter().generate([
+                  {"name": "worker", "status": "ERROR"}
+              ])
+
+              assert report["overall_status"] == "DEGRADED"
+
+          def test_valid_plugin():
+              validator = PluginValidator()
+
+              data = {
+                  "id": "reddit_collector",
+                  "name": "Reddit Collector",
+                  "version": "1.0.0",
+                  "api_version": "1.0",
+                  "enabled": True,
+                  "dependencies": [],
+                  "permissions": ["network"],
+              }
+
+              assert validator.validate_data(data)["valid"]
+
+          def test_invalid_plugin():
+              validator = PluginValidator()
+
+              result = validator.validate_data({
+                  "id": "INVALID ID",
+                  "enabled": "yes",
+              })
+
+              assert not result["valid"]
+
+          def test_plugin_file(tmp_path):
+              validator = PluginValidator()
+
+              path = tmp_path / "plugin.json"
+              path.write_text(json.dumps({
+                  "id": "test_plugin",
+                  "name": "Test",
+                  "version": "1.0.0",
+                  "api_version": "1.0",
+                  "enabled": True,
+              }))
+
+              assert validator.validate_file(path)["valid"]
+
+          def test_dependency_validator():
+              result = DependencyValidator().validate({
+                  "packaging": ">=20"
+              })
+
+              assert result["valid"]
+          '''
+          }
+
+          for filename, content in files.items():
+              path = Path(filename)
+              path.parent.mkdir(parents=True, exist_ok=True)
+
+              if not path.exists():
+                  path.write_text(
+                      content.strip() + "\n",
+                      encoding="utf-8"
+                  )
+                  print("CREATED:", filename)
+              else:
+                  print("PRESERVED:", filename)
+
+          PY
+
+      - name: Run Monitoring Tests
+        run: |
+          python -m pytest tests/test_phase2_monitoring.py -v
+
+      - name: Commit Monitoring Infrastructure
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add platform_core/monitoring
+          git add platform_core/validation
+          git add tests/test_phase2_monitoring.py
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Build Phase 2D monitoring and validation infrastructure"
+            git push
+          else
+            echo "No new files to commit."
+          fi
