@@ -1,0 +1,78 @@
+name: Phase 3A - Repair Generated Files
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase3-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Repair Generated Python Files
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          files = [
+              "platform_core/orchestrator.py",
+              "platform_core/runtime.py",
+              "run_platform.py",
+              "tests/test_phase3_integration.py",
+          ]
+
+          for filename in files:
+              path = Path(filename)
+
+              if not path.exists():
+                  raise FileNotFoundError(filename)
+
+              content = path.read_text(encoding="utf-8")
+
+              if content.endswith("\\n"):
+                  content = content[:-2]
+
+              path.write_text(
+                  content.rstrip() + "\n",
+                  encoding="utf-8"
+              )
+
+              print("REPAIRED:", filename)
+          PY
+
+      - name: Run Integration Tests
+        run: |
+          python -m pytest tests/test_phase3_integration.py -v
+
+      - name: Test Runtime
+        run: |
+          python run_platform.py
+
+      - name: Commit Repairs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add platform_core/orchestrator.py
+          git add platform_core/runtime.py
+          git add run_platform.py
+          git add tests/test_phase3_integration.py
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Fix Phase 3A generated Python files"
+            git push
+          fi
