@@ -1,0 +1,190 @@
+import importlib.metadata
+import importlib.util
+import json
+import re
+import sys
+import uuid
+from pathlib import Path
+
+from platform_core.contracts.base_plugin import BasePlugin
+from platform_core.plugin_system.registry import PluginRegistry
+from platform_core.plugin_system.validator import PluginManifestValidator
+from platform_core.plugin_system.compatibility import PluginCompatibilityChecker
+
+
+class DynamicPluginLoader:
+
+    def __init__(
+        self,
+        plugin_directory="plugins",
+        approved_ids=None
+    ):
+        self.plugin_directory = Path(plugin_directory).resolve()
+        self.registry = PluginRegistry(str(self.plugin_directory))
+        self.validator = PluginManifestValidator()
+        self.compatibility = PluginCompatibilityChecker()
+
+        self.approved_ids = set(approved_ids or [])
+        self.instances = {}
+        self.errors = {}
+
+    def discover(self):
+        return self.registry.discover()
+
+    def _check_dependencies(self, dependencies):
+        for dependency in dependencies:
+            if not isinstance(dependency, str):
+                raise ValueError("Invalid dependency declaration")
+
+            name = re.split(r"[<>=!~;\[]", dependency, 1)[0].strip()
+
+            if not name:
+                raise ValueError("Invalid dependency name")
+
+            try:
+                importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                raise ValueError(
+                    f"Dependency is not installed: {name}"
+                )
+
+    def load(self, plugin_id, context=None):
+
+        if plugin_id in self.instances:
+            raise ValueError("Plugin already loaded")
+
+        manifest = self.registry.get(plugin_id)
+
+        if manifest is None:
+            raise ValueError("Plugin not discovered")
+
+        validation = self.validator.validate(manifest)
+
+        if not validation["valid"]:
+            raise ValueError(
+                f"Invalid manifest: {validation['errors']}"
+            )
+
+        if not manifest["enabled"]:
+            raise PermissionError("Plugin is disabled")
+
+        if plugin_id not in self.approved_ids:
+            raise PermissionError("Plugin approval required")
+
+        compatibility = self.compatibility.check(manifest)
+
+        if not compatibility["compatible"]:
+            raise ValueError("Incompatible plugin API")
+
+        self._check_dependencies(manifest["dependencies"])
+
+        manifest_path = Path(
+            manifest["_manifest_path"]
+        ).resolve()
+
+        plugin_directory = manifest_path.parent
+
+        module_name, class_name = manifest["entry_point"].split(":", 1)
+
+        if not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_.]*",
+            module_name
+        ):
+            raise ValueError("Invalid module path")
+
+        if not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*",
+            class_name
+        ):
+            raise ValueError("Invalid class name")
+
+        module_path = (
+            plugin_directory /
+            (module_name.replace(".", "/") + ".py")
+        ).resolve()
+
+        if not module_path.is_relative_to(plugin_directory):
+            raise ValueError("Module path escapes plugin directory")
+
+        if not module_path.is_file():
+            raise FileNotFoundError(
+                f"Plugin module not found: {module_path}"
+            )
+
+        unique_name = (
+            f"dynamic_plugin_{plugin_id.replace('.', '_')}_"
+            f"{uuid.uuid4().hex}"
+        )
+
+        spec = importlib.util.spec_from_file_location(
+            unique_name,
+            module_path
+        )
+
+        if spec is None or spec.loader is None:
+            raise ImportError("Unable to create plugin module")
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[unique_name] = module
+
+        try:
+            spec.loader.exec_module(module)
+
+            plugin_class = getattr(module, class_name, None)
+
+            if not isinstance(plugin_class, type):
+                raise TypeError("Plugin entry point is not a class")
+
+            if not issubclass(plugin_class, BasePlugin):
+                raise TypeError(
+                    "Plugin must inherit from BasePlugin"
+                )
+
+            plugin = plugin_class()
+
+            if not isinstance(plugin, BasePlugin):
+                raise TypeError("Invalid plugin instance")
+
+            plugin.initialize(context or {})
+
+            self.instances[plugin_id] = plugin
+
+            return {
+                "plugin_id": plugin_id,
+                "status": "LOADED",
+                "class": class_name
+            }
+
+        except Exception:
+            sys.modules.pop(unique_name, None)
+            raise
+
+    def health_check(self, plugin_id):
+        plugin = self.instances.get(plugin_id)
+
+        if plugin is None:
+            return False
+
+        return bool(plugin.health_check())
+
+    def unload(self, plugin_id):
+        plugin = self.instances.pop(plugin_id, None)
+
+        if plugin is None:
+            return False
+
+        try:
+            plugin.shutdown()
+        finally:
+            return True
+
+    def shutdown_all(self):
+        results = {}
+
+        for plugin_id in list(self.instances):
+            try:
+                results[plugin_id] = self.unload(plugin_id)
+            except Exception as error:
+                results[plugin_id] = str(error)
+
+        return results
