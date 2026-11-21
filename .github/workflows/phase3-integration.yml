@@ -1,0 +1,458 @@
+name: Phase 3A - Architecture Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase3-integration
+  cancel-in-progress: false
+
+jobs:
+  integrate-architecture:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest==8.3.5 packaging==25.0
+
+      - name: Create Architecture Runtime
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          files = {
+
+          "platform_core/orchestrator.py": '''
+          class ExecutionOrchestrator:
+
+              def __init__(
+                  self,
+                  worker_manager,
+                  task_manager,
+                  checkpoint_manager,
+              ):
+                  self.worker_manager = worker_manager
+                  self.task_manager = task_manager
+                  self.checkpoints = checkpoint_manager
+
+              def register_worker(self, worker_id, worker, context=None):
+                  self.worker_manager.register(worker_id, worker)
+                  return self.worker_manager.start(
+                      worker_id, context or {}
+                  )
+
+              def create_task(self, worker_id, payload=None, priority=5):
+                  if worker_id not in self.worker_manager.workers:
+                      raise ValueError(
+                          f"Worker not registered: {worker_id}"
+                      )
+
+                  return self.task_manager.create_task(
+                      task_type=worker_id,
+                      payload={
+                          "worker_id": worker_id,
+                          "data": payload or {},
+                      },
+                      priority=priority,
+                  )
+
+              def execute_task(self, task_id):
+                  task = self.task_manager.get_task(task_id)
+
+                  if task is None:
+                      raise KeyError(task_id)
+
+                  if task["status"] != "PENDING":
+                      raise ValueError(
+                          "Only PENDING tasks can be executed"
+                      )
+
+                  worker_id = task["payload"]["worker_id"]
+
+                  self.task_manager.update_status(
+                      task_id, "RUNNING"
+                  )
+
+                  try:
+                      result = self.worker_manager.execute(
+                          worker_id,
+                          task["payload"]["data"],
+                      )
+
+                      self.task_manager.update_status(
+                          task_id, "SUCCESS"
+                      )
+
+                      return {
+                          "task_id": task_id,
+                          "status": "SUCCESS",
+                          "result": result,
+                      }
+
+                  except Exception as exc:
+                      self.task_manager.update_status(
+                          task_id, "FAILED"
+                      )
+
+                      return {
+                          "task_id": task_id,
+                          "status": "FAILED",
+                          "error": str(exc),
+                      }
+          ''',
+
+          "platform_core/runtime.py": '''
+          from platform_core.architecture_initializer import ArchitectureInitializer
+          from platform_core.storage.memory_storage import InMemoryStorage
+          from platform_core.persistence.checkpoint_manager import CheckpointManager
+          from platform_core.persistence.state_loader import StateLoader
+          from platform_core.monitoring.health_monitor import HealthMonitor
+          from platform_core.monitoring.system_reporter import SystemReporter
+          from platform_core.orchestrator import ExecutionOrchestrator
+
+          class WorkerHealthProbe:
+
+              def __init__(self, worker_manager, worker_id):
+                  self.worker_manager = worker_manager
+                  self.worker_id = worker_id
+
+              def health_check(self):
+                  try:
+                      return self.worker_manager.health_check(
+                          self.worker_id
+                      )
+                  except Exception:
+                      return False
+
+          class ArchitectureRuntime:
+
+              def __init__(self, storage=None):
+                  self.storage = storage or InMemoryStorage()
+                  self.initialized = False
+
+              def initialize(self):
+                  if self.initialized:
+                      return self.components
+
+                  self.components = ArchitectureInitializer().initialize()
+
+                  self.worker_registry = self.components[
+                      "worker_registry"
+                  ]
+
+                  self.worker_manager = self.components[
+                      "worker_manager"
+                  ]
+
+                  self.task_manager = self.components[
+                      "task_manager"
+                  ]
+
+                  self.event_bus = self.components[
+                      "event_bus"
+                  ]
+
+                  self.checkpoints = CheckpointManager(
+                      self.storage,
+                      namespace="architecture",
+                  )
+
+                  self.state_loader = StateLoader(
+                      self.checkpoints
+                  )
+
+                  self.health_monitor = HealthMonitor()
+                  self.reporter = SystemReporter()
+
+                  self.orchestrator = ExecutionOrchestrator(
+                      self.worker_manager,
+                      self.task_manager,
+                      self.checkpoints,
+                  )
+
+                  self.previous_state = self.state_loader.restore(
+                      "runtime"
+                  )
+
+                  self.metrics = (
+                      self.previous_state.get("metrics", {})
+                      if self.previous_state
+                      else {"tasks_completed": 0, "tasks_failed": 0}
+                  )
+
+                  self.initialized = True
+                  return self.components
+
+              def register_worker(self, worker_id, worker, context=None):
+                  self._require_initialized()
+
+                  result = self.orchestrator.register_worker(
+                      worker_id, worker, context
+                  )
+
+                  probe = WorkerHealthProbe(
+                      self.worker_manager, worker_id
+                  )
+
+                  self.health_monitor.register(
+                      f"worker:{worker_id}", probe
+                  )
+
+                  return result
+
+              def submit_task(self, worker_id, payload=None, priority=5):
+                  self._require_initialized()
+
+                  return self.orchestrator.create_task(
+                      worker_id, payload, priority
+                  )
+
+              def execute_task(self, task_id):
+                  self._require_initialized()
+
+                  result = self.orchestrator.execute_task(task_id)
+
+                  if result["status"] == "SUCCESS":
+                      self.metrics["tasks_completed"] += 1
+                  else:
+                      self.metrics["tasks_failed"] += 1
+
+                  self.save_state()
+                  return result
+
+              def save_state(self):
+                  self._require_initialized()
+
+                  state = {
+                      "metrics": self.metrics,
+                      "worker_ids": list(
+                          self.worker_manager.workers.keys()
+                      ),
+                  }
+
+                  return self.checkpoints.save(
+                      "runtime", state
+                  )
+
+              def health_report(self):
+                  self._require_initialized()
+
+                  results = self.health_monitor.check_all()
+
+                  return self.reporter.generate(results)
+
+              def shutdown(self):
+                  if not self.initialized:
+                      return
+
+                  self.save_state()
+
+                  for worker_id in list(
+                      self.worker_manager.workers.keys()
+                  ):
+                      if self.worker_manager.status.get(
+                          worker_id
+                      ) == "READY":
+                          self.worker_manager.stop(worker_id)
+
+                  self.initialized = False
+
+              def _require_initialized(self):
+                  if not self.initialized:
+                      raise RuntimeError(
+                          "Architecture Runtime is not initialized"
+                      )
+          ''',
+
+          "run_platform.py": '''
+          import json
+
+          from platform_core.runtime import ArchitectureRuntime
+
+          def main():
+              runtime = ArchitectureRuntime()
+
+              try:
+                  runtime.initialize()
+
+                  print("ARCHITECTURE INITIALIZED")
+
+                  print(json.dumps(
+                      runtime.health_report(),
+                      indent=2,
+                  ))
+
+                  runtime.save_state()
+
+                  print("CHECKPOINT SAVED")
+
+              finally:
+                  runtime.shutdown()
+
+          if __name__ == "__main__":
+              main()
+          ''',
+
+          "tests/test_phase3_integration.py": '''
+          from platform_core.runtime import ArchitectureRuntime
+          from platform_core.storage.memory_storage import InMemoryStorage
+
+          class ExampleWorker:
+
+              def initialize(self, context):
+                  self.ready = True
+
+              def execute(self, task):
+                  return {
+                      "message": "Task completed",
+                      "input": task,
+                  }
+
+              def health_check(self):
+                  return getattr(self, "ready", False)
+
+              def shutdown(self):
+                  self.ready = False
+
+          def test_runtime_initialization():
+              runtime = ArchitectureRuntime()
+              runtime.initialize()
+
+              assert runtime.initialized is True
+
+              runtime.shutdown()
+
+          def test_worker_registration_and_execution():
+              runtime = ArchitectureRuntime()
+              runtime.initialize()
+
+              runtime.register_worker(
+                  "example",
+                  ExampleWorker(),
+              )
+
+              task = runtime.submit_task(
+                  "example",
+                  {"value": 123},
+              )
+
+              result = runtime.execute_task(
+                  task["task_id"]
+              )
+
+              assert result["status"] == "SUCCESS"
+              assert result["result"]["input"]["value"] == 123
+              assert runtime.metrics["tasks_completed"] == 1
+
+              runtime.shutdown()
+
+          def test_checkpoint_save():
+              storage = InMemoryStorage()
+              runtime = ArchitectureRuntime(storage=storage)
+
+              runtime.initialize()
+              runtime.metrics["tasks_completed"] = 5
+              runtime.save_state()
+
+              saved = runtime.checkpoints.load("runtime")
+
+              assert saved["state"]["metrics"]["tasks_completed"] == 5
+
+              runtime.shutdown()
+
+          def test_health_report():
+              runtime = ArchitectureRuntime()
+              runtime.initialize()
+
+              runtime.register_worker(
+                  "example",
+                  ExampleWorker(),
+              )
+
+              report = runtime.health_report()
+
+              assert report["total_components"] == 1
+              assert report["healthy"] == 1
+
+              runtime.shutdown()
+
+          def test_runtime_requires_initialization():
+              runtime = ArchitectureRuntime()
+
+              try:
+                  runtime.submit_task("example")
+                  assert False
+              except RuntimeError:
+                  assert True
+
+          def test_failed_task():
+              class BrokenWorker(ExampleWorker):
+                  def execute(self, task):
+                      raise ValueError("Test failure")
+
+              runtime = ArchitectureRuntime()
+              runtime.initialize()
+              runtime.register_worker("broken", BrokenWorker())
+
+              task = runtime.submit_task("broken")
+              result = runtime.execute_task(task["task_id"])
+
+              assert result["status"] == "FAILED"
+              assert runtime.metrics["tasks_failed"] == 1
+
+              runtime.shutdown()
+          '''
+          }
+
+          for filename, content in files.items():
+              path = Path(filename)
+              path.parent.mkdir(parents=True, exist_ok=True)
+
+              if not path.exists():
+                  path.write_text(
+                      content.strip() + "\\n",
+                      encoding="utf-8"
+                  )
+                  print("CREATED:", filename)
+              else:
+                  print("PRESERVED:", filename)
+
+          PY
+
+      - name: Run Integration Tests
+        run: |
+          python -m pytest tests/test_phase3_integration.py -v
+
+      - name: Test Runtime Entry Point
+        run: |
+          python run_platform.py
+
+      - name: Commit Integration Infrastructure
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add platform_core/orchestrator.py
+          git add platform_core/runtime.py
+          git add run_platform.py
+          git add tests/test_phase3_integration.py
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Build Phase 3A architecture integration"
+            git push
+          else
+            echo "No new files to commit."
+          fi
