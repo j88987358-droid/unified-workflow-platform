@@ -1,0 +1,378 @@
+name: Phase 3B-3 - Automatic Plugin Worker Registration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase3b-auto-registration
+  cancel-in-progress: false
+
+jobs:
+  auto-registration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create Automatic Registration System
+        run: |
+          mkdir -p platform_core/plugin_system
+          mkdir -p config
+          mkdir -p tests
+
+          cat > platform_core/plugin_system/auto_registrar.py <<'PY'
+          import json
+          from pathlib import Path
+
+          from platform_core.plugin_system.dynamic_loader import DynamicPluginLoader
+          from platform_core.plugin_system.dynamic_worker_loader import DynamicWorkerLoader
+          from platform_core.plugin_system.manager import PluginManager
+          from platform_core.plugin_system.registry import PluginRegistry
+
+
+          class WorkerHealthProbe:
+              def __init__(self, manager, worker_id):
+                  self.manager = manager
+                  self.worker_id = worker_id
+
+              def health_check(self):
+                  try:
+                      return self.manager.health_check(self.worker_id)
+                  except Exception:
+                      return False
+
+
+          class AutomaticRegistrar:
+
+              def __init__(
+                  self,
+                  runtime,
+                  plugin_directory="plugins",
+                  worker_directory="plugins/workers",
+                  approval_file="config/registration-approvals.json"
+              ):
+                  self.runtime = runtime
+                  self.plugin_directory = plugin_directory
+                  self.worker_directory = worker_directory
+                  self.approval_file = Path(approval_file)
+
+                  self.results = {
+                      "plugins": {},
+                      "workers": {},
+                      "errors": []
+                  }
+
+                  self._load_approvals()
+
+              def _load_approvals(self):
+                  if not self.approval_file.exists():
+                      self.approvals = {
+                          "approved_plugin_ids": [],
+                          "approved_worker_ids": []
+                      }
+                      return
+
+                  data = json.loads(
+                      self.approval_file.read_text(encoding="utf-8")
+                  )
+
+                  if not isinstance(data, dict):
+                      raise ValueError("Invalid approval configuration")
+
+                  plugins = data.get("approved_plugin_ids", [])
+                  workers = data.get("approved_worker_ids", [])
+
+                  if not isinstance(plugins, list):
+                      raise ValueError("Plugin approvals must be a list")
+
+                  if not isinstance(workers, list):
+                      raise ValueError("Worker approvals must be a list")
+
+                  self.approvals = {
+                      "approved_plugin_ids": plugins,
+                      "approved_worker_ids": workers
+                  }
+
+              def register_plugins(self, context=None):
+
+                  registry = PluginRegistry(self.plugin_directory)
+
+                  loader = DynamicPluginLoader(
+                      plugin_directory=self.plugin_directory,
+                      approved_ids=self.approvals["approved_plugin_ids"]
+                  )
+
+                  loader.discover()
+
+                  manager = PluginManager(registry)
+                  manager.registry = loader.registry
+
+                  for plugin_id in self.approvals["approved_plugin_ids"]:
+                      try:
+                          result = loader.load(plugin_id, context or {})
+
+                          instance = loader.instances[plugin_id]
+
+                          manager.register_instance(
+                              plugin_id,
+                              instance
+                          )
+
+                          self.results["plugins"][plugin_id] = result
+
+                      except Exception as error:
+                          self.results["errors"].append({
+                              "component": "plugin",
+                              "id": plugin_id,
+                              "error": str(error)
+                          })
+
+                  self.plugin_loader = loader
+                  self.plugin_manager = manager
+
+                  return self.results["plugins"]
+
+              def register_workers(self, context=None):
+
+                  loader = DynamicWorkerLoader(
+                      worker_directory=self.worker_directory,
+                      approved_worker_ids=self.approvals["approved_worker_ids"]
+                  )
+
+                  loader.discover()
+
+                  # Use the main ArchitectureRuntime WorkerManager.
+                  loader.manager = self.runtime.worker_manager
+
+                  for worker_id in self.approvals["approved_worker_ids"]:
+                      try:
+                          result = loader.load(
+                              worker_id,
+                              context or {}
+                          )
+
+                          probe = WorkerHealthProbe(
+                              self.runtime.worker_manager,
+                              worker_id
+                          )
+
+                          self.runtime.health_monitor.register(
+                              f"worker:{worker_id}",
+                              probe
+                          )
+
+                          self.results["workers"][worker_id] = result
+
+                      except Exception as error:
+                          self.results["errors"].append({
+                              "component": "worker",
+                              "id": worker_id,
+                              "error": str(error)
+                          })
+
+                  self.worker_loader = loader
+
+                  return self.results["workers"]
+
+              def register_all(self, context=None):
+
+                  if not self.runtime.initialized:
+                      raise RuntimeError(
+                          "ArchitectureRuntime must be initialized first"
+                      )
+
+                  self.register_plugins(context)
+                  self.register_workers(context)
+
+                  return self.report()
+
+              def report(self):
+
+                  return {
+                      "plugin_count": len(self.results["plugins"]),
+                      "worker_count": len(self.results["workers"]),
+                      "error_count": len(self.results["errors"]),
+                      "plugins": self.results["plugins"],
+                      "workers": self.results["workers"],
+                      "errors": self.results["errors"]
+                  }
+
+              def shutdown(self):
+
+                  results = {
+                      "plugins": {},
+                      "workers": {}
+                  }
+
+                  if hasattr(self, "plugin_loader"):
+                      results["plugins"] = (
+                          self.plugin_loader.shutdown_all()
+                      )
+
+                  if hasattr(self, "worker_loader"):
+                      results["workers"] = (
+                          self.worker_loader.shutdown_all()
+                      )
+
+                  return results
+          PY
+
+          cat > config/registration-approvals.json <<'JSON'
+          {
+            "approved_plugin_ids": [],
+            "approved_worker_ids": []
+          }
+          JSON
+
+          cat > tests/test_phase3b_auto_registration.py <<'PY'
+          import json
+
+          import pytest
+
+          from platform_core.runtime import ArchitectureRuntime
+          from platform_core.plugin_system.auto_registrar import AutomaticRegistrar
+
+
+          def test_empty_approval_registration(tmp_path):
+
+              approval_file = tmp_path / "approvals.json"
+
+              approval_file.write_text(
+                  json.dumps({
+                      "approved_plugin_ids": [],
+                      "approved_worker_ids": []
+                  }),
+                  encoding="utf-8"
+              )
+
+              runtime = ArchitectureRuntime()
+              runtime.initialize()
+
+              registrar = AutomaticRegistrar(
+                  runtime=runtime,
+                  plugin_directory=str(tmp_path / "plugins"),
+                  worker_directory=str(tmp_path / "workers"),
+                  approval_file=str(approval_file)
+              )
+
+              report = registrar.register_all()
+
+              assert report["plugin_count"] == 0
+              assert report["worker_count"] == 0
+              assert report["error_count"] == 0
+
+              runtime.shutdown()
+
+
+          def test_registration_requires_initialized_runtime(tmp_path):
+
+              approval_file = tmp_path / "approvals.json"
+
+              approval_file.write_text(
+                  json.dumps({
+                      "approved_plugin_ids": [],
+                      "approved_worker_ids": []
+                  }),
+                  encoding="utf-8"
+              )
+
+              runtime = ArchitectureRuntime()
+
+              registrar = AutomaticRegistrar(
+                  runtime=runtime,
+                  approval_file=str(approval_file)
+              )
+
+              with pytest.raises(RuntimeError):
+                  registrar.register_all()
+
+
+          def test_invalid_approval_configuration(tmp_path):
+
+              approval_file = tmp_path / "approvals.json"
+
+              approval_file.write_text(
+                  json.dumps({
+                      "approved_plugin_ids": "invalid",
+                      "approved_worker_ids": []
+                  }),
+                  encoding="utf-8"
+              )
+
+              runtime = ArchitectureRuntime()
+              runtime.initialize()
+
+              with pytest.raises(ValueError):
+                  AutomaticRegistrar(
+                      runtime=runtime,
+                      approval_file=str(approval_file)
+                  )
+
+              runtime.shutdown()
+
+
+          def test_registration_report_structure(tmp_path):
+
+              approval_file = tmp_path / "approvals.json"
+
+              approval_file.write_text(
+                  json.dumps({
+                      "approved_plugin_ids": [],
+                      "approved_worker_ids": []
+                  }),
+                  encoding="utf-8"
+              )
+
+              runtime = ArchitectureRuntime()
+              runtime.initialize()
+
+              registrar = AutomaticRegistrar(
+                  runtime=runtime,
+                  approval_file=str(approval_file)
+              )
+
+              report = registrar.register_all()
+
+              assert "plugins" in report
+              assert "workers" in report
+              assert "errors" in report
+
+              runtime.shutdown()
+          PY
+
+      - name: Install Test Dependencies
+        run: |
+          python -m pip install pytest==8.3.5 packaging==25.0
+
+      - name: Run Automatic Registration Tests
+        run: |
+          python -m pytest tests/test_phase3b_auto_registration.py -v
+
+      - name: Compile Python Files
+        run: |
+          python -m compileall -q platform_core tests
+
+      - name: Commit Changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add platform_core/plugin_system/auto_registrar.py
+          git add config/registration-approvals.json
+          git add tests/test_phase3b_auto_registration.py
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Add Phase 3B automatic registration"
+            git push
+          fi
