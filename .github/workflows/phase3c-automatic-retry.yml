@@ -95,7 +95,9 @@ jobs:
 
               def calculate_delay(self, retry_number):
                   if retry_number < 1:
-                      raise ValueError("retry_number must be positive")
+                      raise ValueError(
+                          "retry_number must be positive"
+                      )
 
                   delay = self.base_delay_seconds * (
                       2 ** (retry_number - 1)
@@ -153,6 +155,7 @@ jobs:
 
               def get_due_retries(self):
                   now = self._now()
+
                   tasks = self.task_manager.list_tasks(
                       status="RETRY"
                   )
@@ -165,7 +168,9 @@ jobs:
                       if not retry_at:
                           continue
 
-                      retry_time = datetime.fromisoformat(retry_at)
+                      retry_time = datetime.fromisoformat(
+                          retry_at
+                      )
 
                       if retry_time.tzinfo is None:
                           retry_time = retry_time.replace(
@@ -202,7 +207,7 @@ jobs:
                   return results
           PY
 
-      - name: Create Retry System Tests
+      - name: Create Automatic Retry Tests
         run: |
           mkdir -p tests
 
@@ -211,13 +216,18 @@ jobs:
 
           import pytest
 
-          from platform_core.storage.memory_storage import InMemoryStorage
+          from platform_core.storage.memory_storage import (
+              InMemoryStorage,
+          )
+
           from platform_core.task_queue.persistent_task_manager import (
               PersistentTaskManager,
           )
+
           from platform_core.task_queue.task_lifecycle_manager import (
               TaskLifecycleManager,
           )
+
           from platform_core.task_queue.retry_controller import (
               RetryController,
           )
@@ -241,8 +251,11 @@ jobs:
           @pytest.fixture
           def setup():
               storage = InMemoryStorage()
+
               manager = PersistentTaskManager(storage)
+
               lifecycle = TaskLifecycleManager(manager)
+
               clock = FakeClock()
 
               retry = RetryController(
@@ -255,20 +268,41 @@ jobs:
 
               task = manager.create_task("example.worker")
 
-              return manager, lifecycle, retry, clock, task["task_id"]
+              return (
+                  manager,
+                  lifecycle,
+                  retry,
+                  clock,
+                  task["task_id"],
+              )
 
 
-          def fail_task(lifecycle, task_id):
-              lifecycle.mark_running(task_id)
-              lifecycle.mark_failed(task_id, "Temporary error")
+          def fail_task(manager, lifecycle, task_id):
+              status = manager.get_task(task_id)["status"]
+
+              if status in ("PENDING", "RETRY"):
+                  lifecycle.mark_running(task_id)
+
+              elif status != "RUNNING":
+                  raise ValueError(
+                      f"Unexpected status: {status}"
+                  )
+
+              lifecycle.mark_failed(
+                  task_id,
+                  "Temporary error",
+              )
 
 
           def test_first_retry_scheduled(setup):
               manager, lifecycle, retry, clock, task_id = setup
 
-              fail_task(lifecycle, task_id)
+              fail_task(manager, lifecycle, task_id)
 
-              task = retry.handle_failure(task_id, "Network error")
+              task = retry.handle_failure(
+                  task_id,
+                  "Network error",
+              )
 
               assert task["status"] == "RETRY"
               assert task["retry_count"] == 1
@@ -278,11 +312,10 @@ jobs:
           def test_second_retry_uses_exponential_backoff(setup):
               manager, lifecycle, retry, clock, task_id = setup
 
-              fail_task(lifecycle, task_id)
+              fail_task(manager, lifecycle, task_id)
               retry.handle_failure(task_id)
 
-              lifecycle.mark_running(task_id)
-              lifecycle.mark_failed(task_id)
+              fail_task(manager, lifecycle, task_id)
 
               task = retry.handle_failure(task_id)
 
@@ -293,14 +326,12 @@ jobs:
           def test_third_retry_uses_four_minutes(setup):
               manager, lifecycle, retry, clock, task_id = setup
 
-              for _ in range(2):
-                  fail_task(lifecycle, task_id)
-                  retry.handle_failure(task_id)
-                  lifecycle.mark_running(task_id)
-                  lifecycle.mark_failed(task_id)
+              for _ in range(3):
+                  fail_task(manager, lifecycle, task_id)
 
-              task = retry.handle_failure(task_id)
+                  task = retry.handle_failure(task_id)
 
+              assert task["status"] == "RETRY"
               assert task["retry_count"] == 3
               assert task["backoff_seconds"] == 240
 
@@ -314,7 +345,7 @@ jobs:
           def test_retry_not_due_immediately(setup):
               manager, lifecycle, retry, clock, task_id = setup
 
-              fail_task(lifecycle, task_id)
+              fail_task(manager, lifecycle, task_id)
               retry.handle_failure(task_id)
 
               assert retry.get_due_retries() == []
@@ -323,7 +354,7 @@ jobs:
           def test_retry_becomes_due_after_delay(setup):
               manager, lifecycle, retry, clock, task_id = setup
 
-              fail_task(lifecycle, task_id)
+              fail_task(manager, lifecycle, task_id)
               retry.handle_failure(task_id)
 
               clock.advance(60)
@@ -337,7 +368,7 @@ jobs:
           def test_due_retry_can_be_claimed(setup):
               manager, lifecycle, retry, clock, task_id = setup
 
-              fail_task(lifecycle, task_id)
+              fail_task(manager, lifecycle, task_id)
               retry.handle_failure(task_id)
 
               clock.advance(60)
@@ -350,7 +381,7 @@ jobs:
           def test_early_retry_cannot_be_claimed(setup):
               manager, lifecycle, retry, clock, task_id = setup
 
-              fail_task(lifecycle, task_id)
+              fail_task(manager, lifecycle, task_id)
               retry.handle_failure(task_id)
 
               assert retry.claim_due_retry(task_id) is None
@@ -359,7 +390,7 @@ jobs:
           def test_retry_history_is_recorded(setup):
               manager, lifecycle, retry, clock, task_id = setup
 
-              fail_task(lifecycle, task_id)
+              fail_task(manager, lifecycle, task_id)
               retry.handle_failure(task_id)
 
               history = lifecycle.get_history(task_id)
@@ -374,7 +405,8 @@ jobs:
               manager, lifecycle, retry, clock, task_id = setup
 
               for _ in range(3):
-                  fail_task(lifecycle, task_id)
+                  fail_task(manager, lifecycle, task_id)
+
                   retry.handle_failure(task_id)
 
                   if manager.get_task(task_id)["status"] == "RETRY":
@@ -390,7 +422,8 @@ jobs:
           def test_retry_metadata_is_saved(setup):
               manager, lifecycle, retry, clock, task_id = setup
 
-              fail_task(lifecycle, task_id)
+              fail_task(manager, lifecycle, task_id)
+
               task = retry.handle_failure(
                   task_id,
                   "Temporary API failure",
@@ -403,7 +436,7 @@ jobs:
           def test_due_retry_processing(setup):
               manager, lifecycle, retry, clock, task_id = setup
 
-              fail_task(lifecycle, task_id)
+              fail_task(manager, lifecycle, task_id)
               retry.handle_failure(task_id)
 
               clock.advance(60)
