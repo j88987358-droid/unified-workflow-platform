@@ -1,0 +1,405 @@
+name: Phase 2C - Persistence Infrastructure
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase2-persistence
+  cancel-in-progress: false
+
+jobs:
+  build-persistence:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Test Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest==8.3.5
+
+      - name: Create Persistence Infrastructure
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          files = {
+          "platform_core/storage/__init__.py": '''
+          from .base_storage import BaseStorage
+          from .memory_storage import InMemoryStorage
+
+          __all__ = ["BaseStorage", "InMemoryStorage"]
+          ''',
+
+          "platform_core/storage/base_storage.py": '''
+          from abc import ABC, abstractmethod
+
+          class BaseStorage(ABC):
+
+              @abstractmethod
+              def get(self, key):
+                  pass
+
+              @abstractmethod
+              def set(self, key, value):
+                  pass
+
+              @abstractmethod
+              def delete(self, key):
+                  pass
+          ''',
+
+          "platform_core/storage/memory_storage.py": '''
+          from .base_storage import BaseStorage
+
+          class InMemoryStorage(BaseStorage):
+
+              def __init__(self):
+                  self.data = {}
+
+              def get(self, key):
+                  return self.data.get(key)
+
+              def set(self, key, value):
+                  self.data[key] = value
+                  return True
+
+              def delete(self, key):
+                  self.data.pop(key, None)
+                  return True
+          ''',
+
+          "platform_core/storage/google_sheets.py": '''
+          import json
+          from datetime import datetime, timezone
+
+          from .base_storage import BaseStorage
+
+          class GoogleSheetsStorage(BaseStorage):
+
+              def __init__(self, spreadsheet_id, worksheet="Persistence"):
+                  import os
+                  from google.oauth2.service_account import Credentials
+                  from googleapiclient.discovery import build
+
+                  credentials_json = os.environ.get(
+                      "GOOGLE_SERVICE_ACCOUNT_JSON"
+                  )
+
+                  if not credentials_json:
+                      raise RuntimeError(
+                          "GOOGLE_SERVICE_ACCOUNT_JSON is missing"
+                      )
+
+                  credentials = Credentials.from_service_account_info(
+                      json.loads(credentials_json),
+                      scopes=[
+                          "https://www.googleapis.com/auth/spreadsheets"
+                      ],
+                  )
+
+                  self.service = build(
+                      "sheets", "v4",
+                      credentials=credentials,
+                      cache_discovery=False,
+                  )
+
+                  self.spreadsheet_id = spreadsheet_id
+                  self.worksheet = worksheet
+                  self._ensure_header()
+
+              def _range(self):
+                  return f"{self.worksheet}!A:C"
+
+              def _ensure_header(self):
+                  result = self.service.spreadsheets().values().get(
+                      spreadsheetId=self.spreadsheet_id,
+                      range=f"{self.worksheet}!A1:C1",
+                  ).execute()
+
+                  if not result.get("values"):
+                      self.service.spreadsheets().values().update(
+                          spreadsheetId=self.spreadsheet_id,
+                          range=f"{self.worksheet}!A1:C1",
+                          valueInputOption="RAW",
+                          body={"values": [[
+                              "key", "value_json", "updated_at"
+                          ]]},
+                      ).execute()
+
+              def _rows(self):
+                  result = self.service.spreadsheets().values().get(
+                      spreadsheetId=self.spreadsheet_id,
+                      range=self._range(),
+                  ).execute()
+
+                  return result.get("values", [])
+
+              def get(self, key):
+                  for row in self._rows()[1:]:
+                      if row and row[0] == key:
+                          return json.loads(row[1])
+                  return None
+
+              def set(self, key, value):
+                  rows = self._rows()
+                  now = datetime.now(timezone.utc).isoformat()
+                  encoded = json.dumps(value, ensure_ascii=False)
+
+                  for index, row in enumerate(rows[1:], start=2):
+                      if row and row[0] == key:
+                          target = f"{self.worksheet}!A{index}:C{index}"
+                          self.service.spreadsheets().values().update(
+                              spreadsheetId=self.spreadsheet_id,
+                              range=target,
+                              valueInputOption="RAW",
+                              body={"values": [[key, encoded, now]]},
+                          ).execute()
+                          return True
+
+                  self.service.spreadsheets().values().append(
+                      spreadsheetId=self.spreadsheet_id,
+                      range=self._range(),
+                      valueInputOption="RAW",
+                      insertDataOption="INSERT_ROWS",
+                      body={"values": [[key, encoded, now]]},
+                  ).execute()
+
+                  return True
+
+              def delete(self, key):
+                  rows = self._rows()
+
+                  for index, row in enumerate(rows[1:], start=2):
+                      if row and row[0] == key:
+                          self.service.spreadsheets().values().clear(
+                              spreadsheetId=self.spreadsheet_id,
+                              range=f"{self.worksheet}!A{index}:C{index}",
+                          ).execute()
+                          return True
+
+                  return False
+          ''',
+
+          "platform_core/persistence/checkpoint_manager.py": '''
+          from datetime import datetime, timezone
+
+          class CheckpointManager:
+
+              def __init__(self, storage, namespace="architecture"):
+                  self.storage = storage
+                  self.namespace = namespace
+
+              def save(self, name, state):
+                  payload = {
+                      "state": state,
+                      "saved_at": datetime.now(
+                          timezone.utc
+                      ).isoformat(),
+                  }
+                  return self.storage.set(
+                      f"{self.namespace}:checkpoint:{name}",
+                      payload,
+                  )
+
+              def load(self, name):
+                  return self.storage.get(
+                      f"{self.namespace}:checkpoint:{name}"
+                  )
+
+              def delete(self, name):
+                  return self.storage.delete(
+                      f"{self.namespace}:checkpoint:{name}"
+                  )
+          ''',
+
+          "platform_core/persistence/state_loader.py": '''
+          class StateLoader:
+
+              def __init__(self, checkpoint_manager):
+                  self.checkpoints = checkpoint_manager
+
+              def restore(self, checkpoint_name):
+                  result = self.checkpoints.load(checkpoint_name)
+
+                  if result is None:
+                      return None
+
+                  return result.get("state")
+          ''',
+
+          "platform_core/persistence/state_saver.py": '''
+          class StateSaver:
+
+              def __init__(self, checkpoint_manager):
+                  self.checkpoints = checkpoint_manager
+
+              def save(self, checkpoint_name, state):
+                  return self.checkpoints.save(
+                      checkpoint_name, state
+                  )
+          ''',
+
+          "platform_core/persistence/migration_manager.py": '''
+          class MigrationManager:
+
+              def __init__(self, storage, current_version=1):
+                  self.storage = storage
+                  self.current_version = current_version
+                  self.version_key = "platform:schema_version"
+
+              def get_version(self):
+                  return self.storage.get(self.version_key) or 0
+
+              def needs_migration(self):
+                  return self.get_version() < self.current_version
+
+              def mark_current(self):
+                  return self.storage.set(
+                      self.version_key,
+                      self.current_version,
+                  )
+          ''',
+
+          "platform_core/persistence/recovery_manager.py": '''
+          class RecoveryManager:
+
+              def __init__(self, state_loader):
+                  self.state_loader = state_loader
+
+              def recover(self, checkpoint_name):
+                  state = self.state_loader.restore(checkpoint_name)
+
+                  if state is None:
+                      return {
+                          "recovered": False,
+                          "state": None,
+                      }
+
+                  return {
+                      "recovered": True,
+                      "state": state,
+                  }
+          ''',
+
+          "platform_core/persistence/__init__.py": '''
+          from .checkpoint_manager import CheckpointManager
+          from .state_loader import StateLoader
+          from .state_saver import StateSaver
+          from .migration_manager import MigrationManager
+          from .recovery_manager import RecoveryManager
+
+          __all__ = [
+              "CheckpointManager",
+              "StateLoader",
+              "StateSaver",
+              "MigrationManager",
+              "RecoveryManager",
+          ]
+          ''',
+
+          "requirements-persistence.txt": '''
+          google-api-python-client==2.149.0
+          google-auth==2.35.0
+          ''',
+
+          "tests/test_phase2_persistence.py": '''
+          from platform_core.storage.memory_storage import InMemoryStorage
+          from platform_core.persistence.checkpoint_manager import CheckpointManager
+          from platform_core.persistence.state_loader import StateLoader
+          from platform_core.persistence.state_saver import StateSaver
+          from platform_core.persistence.migration_manager import MigrationManager
+          from platform_core.persistence.recovery_manager import RecoveryManager
+
+          def test_checkpoint_save_and_restore():
+              storage = InMemoryStorage()
+              manager = CheckpointManager(storage)
+
+              manager.save("daily-job", {"completed": 10})
+
+              loader = StateLoader(manager)
+
+              assert loader.restore("daily-job") == {"completed": 10}
+
+          def test_state_saver():
+              storage = InMemoryStorage()
+              manager = CheckpointManager(storage)
+              saver = StateSaver(manager)
+
+              saver.save("test", {"status": "success"})
+
+              assert manager.load("test")["state"]["status"] == "success"
+
+          def test_migration_manager():
+              storage = InMemoryStorage()
+              migration = MigrationManager(storage, current_version=1)
+
+              assert migration.needs_migration()
+
+              migration.mark_current()
+
+              assert not migration.needs_migration()
+
+          def test_recovery_manager():
+              storage = InMemoryStorage()
+              manager = CheckpointManager(storage)
+              manager.save("job", {"progress": 50})
+
+              recovery = RecoveryManager(StateLoader(manager))
+              result = recovery.recover("job")
+
+              assert result["recovered"] is True
+              assert result["state"]["progress"] == 50
+
+          def test_missing_checkpoint():
+              storage = InMemoryStorage()
+              manager = CheckpointManager(storage)
+
+              assert manager.load("missing") is None
+          '''
+          }
+
+          for filename, content in files.items():
+              path = Path(filename)
+              path.parent.mkdir(parents=True, exist_ok=True)
+
+              if not path.exists():
+                  path.write_text(
+                      content.strip() + "\n",
+                      encoding="utf-8"
+                  )
+                  print("CREATED:", filename)
+              else:
+                  print("PRESERVED:", filename)
+          PY
+
+      - name: Run Persistence Tests
+        run: |
+          python -m pytest tests/test_phase2_persistence.py -v
+
+      - name: Commit Persistence Infrastructure
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add platform_core/storage
+          git add platform_core/persistence
+          git add requirements-persistence.txt
+          git add tests/test_phase2_persistence.py
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Build Phase 2C persistence infrastructure"
+            git push
+          else
+            echo "No new files to commit."
+          fi
