@@ -1,0 +1,151 @@
+name: Phase 3C-6 Storage API Integration Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase3c6-storage-api-test
+  cancel-in-progress: false
+
+jobs:
+  storage-api-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Requests
+        run: pip install requests
+
+      - name: Test Google Apps Script Storage API
+        env:
+          APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+          APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import uuid
+          import requests
+
+          url = os.environ.get("APPS_SCRIPT_URL", "").strip()
+          token = os.environ.get("APPS_SCRIPT_TOKEN", "").strip()
+
+          if not url or not token:
+              raise SystemExit("ERROR: Required GitHub Secrets are missing.")
+
+          if not url.startswith("https://script.google.com/"):
+              raise SystemExit("ERROR: Invalid Apps Script URL.")
+
+          session = requests.Session()
+
+          def call_api(action, key=None, value=None):
+              payload = {
+                  "token": token,
+                  "action": action
+              }
+
+              if key is not None:
+                  payload["key"] = key
+
+              if value is not None:
+                  payload["value"] = value
+
+              response = session.post(
+                  url,
+                  json=payload,
+                  timeout=45,
+                  allow_redirects=True
+              )
+
+              response.raise_for_status()
+
+              try:
+                  result = response.json()
+              except Exception:
+                  raise RuntimeError(
+                      "API returned a non-JSON response. "
+                      "Check deployment access and URL."
+                  )
+
+              if not result.get("success"):
+                  raise RuntimeError(
+                      f"API operation failed: {result}"
+                  )
+
+              return result
+
+          print("TEST 1: API Authentication and Ping")
+
+          result = call_api("ping")
+
+          assert result.get("status") == "CONNECTED"
+          print("PASS: API connection and authentication")
+
+          test_key = "phase3c6:test:" + str(uuid.uuid4())
+
+          test_value = {
+              "task_id": "test-task-001",
+              "status": "PENDING",
+              "retry_count": 2,
+              "payload": {
+                  "source": "github-actions",
+                  "test": True
+              }
+          }
+
+          print("TEST 2: Write Data")
+
+          result = call_api("set", test_key, test_value)
+          assert result.get("action") == "SET"
+          print("PASS: Data written to Google Sheets")
+
+          print("TEST 3: Read Data")
+
+          result = call_api("get", test_key)
+
+          assert result.get("found") is True
+          assert result.get("value") == test_value
+
+          print("PASS: Data read and verified")
+
+          updated_value = {
+              **test_value,
+              "status": "SUCCESS",
+              "retry_count": 0
+          }
+
+          print("TEST 4: Update Data")
+
+          result = call_api("set", test_key, updated_value)
+
+          assert result.get("action") == "SET"
+
+          result = call_api("get", test_key)
+
+          assert result.get("value") == updated_value
+          print("PASS: Data updated and verified")
+
+          print("TEST 5: Delete Data")
+
+          result = call_api("delete", test_key)
+
+          assert result.get("action") == "DELETE"
+
+          result = call_api("get", test_key)
+
+          assert result.get("found") is False
+          print("PASS: Data deleted and verified")
+
+          print("\nALL STORAGE API TESTS PASSED")
+          PY
