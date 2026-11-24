@@ -1,0 +1,332 @@
+name: Phase 3C-6C Persistent Task Queue Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase3c-6c-persistent-task-queue
+  cancel-in-progress: false
+
+jobs:
+  persistent-task-queue:
+    runs-on: ubuntu-latest
+
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+      GOOGLE_APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pytest==8.3.5
+
+      - name: Verify Existing Architecture Files
+        run: |
+          test -f platform_core/storage/apps_script_storage.py
+          test -f platform_core/task_queue/persistent_task_manager.py
+
+          echo "Required architecture files found."
+
+      - name: Create Integration Tests
+        run: |
+          mkdir -p tests
+
+          cat > tests/test_phase3c6c_task_queue.py <<'PY'
+          from platform_core.task_queue.persistent_task_manager import (
+              PersistentTaskManager
+          )
+
+
+          class FakeStorage:
+              def __init__(self):
+                  self.data = {}
+
+              def get(self, key):
+                  return self.data.get(key)
+
+              def set(self, key, value):
+                  self.data[key] = value
+
+              def delete(self, key):
+                  self.data.pop(key, None)
+
+
+          def test_task_creation():
+              storage = FakeStorage()
+              manager = PersistentTaskManager(storage)
+
+              task = manager.create_task(
+                  task_type="test_worker",
+                  payload={"message": "hello"}
+              )
+
+              assert task["task_type"] == "test_worker"
+              assert task["status"] == "PENDING"
+              assert manager.get_task(task["task_id"]) is not None
+
+
+          def test_task_status_update():
+              storage = FakeStorage()
+              manager = PersistentTaskManager(storage)
+
+              task = manager.create_task("test_worker")
+
+              manager.update_status(
+                  task["task_id"],
+                  "RUNNING"
+              )
+
+              manager.update_status(
+                  task["task_id"],
+                  "SUCCESS"
+              )
+
+              result = manager.get_task(task["task_id"])
+
+              assert result["status"] == "SUCCESS"
+
+
+          def test_idempotency():
+              storage = FakeStorage()
+              manager = PersistentTaskManager(storage)
+
+              first = manager.create_task(
+                  "test_worker",
+                  idempotency_key="unique-test-key"
+              )
+
+              second = manager.create_task(
+                  "test_worker",
+                  idempotency_key="unique-test-key"
+              )
+
+              assert first["task_id"] == second["task_id"]
+
+
+          def test_priority_ordering():
+              storage = FakeStorage()
+              manager = PersistentTaskManager(storage)
+
+              manager.create_task("low", priority=10)
+              manager.create_task("high", priority=1)
+              manager.create_task("medium", priority=5)
+
+              tasks = manager.list_tasks()
+
+              assert tasks[0]["priority"] == 1
+              assert tasks[1]["priority"] == 5
+              assert tasks[2]["priority"] == 10
+
+
+          def test_next_pending_task():
+              storage = FakeStorage()
+              manager = PersistentTaskManager(storage)
+
+              manager.create_task("low", priority=10)
+              manager.create_task("high", priority=1)
+
+              task = manager.get_next_pending_task()
+
+              assert task["priority"] == 1
+
+
+          def test_delete_task():
+              storage = FakeStorage()
+              manager = PersistentTaskManager(storage)
+
+              task = manager.create_task(
+                  "test_worker",
+                  idempotency_key="delete-test"
+              )
+
+              assert manager.delete_task(task["task_id"])
+              assert manager.get_task(task["task_id"]) is None
+              assert manager.delete_task(task["task_id"]) is False
+
+
+          def test_independent_managers_share_storage():
+              storage = FakeStorage()
+
+              manager_a = PersistentTaskManager(storage)
+              manager_b = PersistentTaskManager(storage)
+
+              task = manager_a.create_task(
+                  "shared_worker",
+                  payload={"source": "manager_a"}
+              )
+
+              result = manager_b.get_task(task["task_id"])
+
+              assert result is not None
+              assert result["payload"]["source"] == "manager_a"
+
+
+          def test_invalid_status():
+              storage = FakeStorage()
+              manager = PersistentTaskManager(storage)
+
+              task = manager.create_task("test_worker")
+
+              try:
+                  manager.update_status(
+                      task["task_id"],
+                      "INVALID"
+                  )
+                  assert False, "Expected ValueError"
+              except ValueError:
+                  pass
+
+
+          def test_missing_task():
+              storage = FakeStorage()
+              manager = PersistentTaskManager(storage)
+
+              assert manager.get_task("missing-task") is None
+          PY
+
+      - name: Run Unit Tests
+        run: |
+          python -m pytest -v tests/test_phase3c6c_task_queue.py
+
+      - name: Live Google Sheets Integration
+        run: |
+          python - <<'PY'
+          import os
+          import uuid
+
+          from platform_core.storage.apps_script_storage import AppsScriptStorage
+          from platform_core.task_queue.persistent_task_manager import (
+              PersistentTaskManager
+          )
+
+          url = os.environ["GOOGLE_APPS_SCRIPT_URL"]
+          token = os.environ["GOOGLE_APPS_SCRIPT_TOKEN"]
+
+          storage_a = AppsScriptStorage(url, token)
+          storage_b = AppsScriptStorage(url, token)
+
+          manager_a = PersistentTaskManager(storage_a)
+          manager_b = PersistentTaskManager(storage_b)
+
+          assert storage_a.health_check()
+          print("PASS: Google Apps Script connection")
+
+          unique = uuid.uuid4().hex
+          idempotency_key = f"phase3c6c-{unique}"
+
+          task = None
+
+          try:
+              # 1. Create task using Manager A
+              task = manager_a.create_task(
+                  task_type="integration_test_worker",
+                  payload={
+                      "test_id": unique,
+                      "source": "github_actions"
+                  },
+                  priority=1,
+                  idempotency_key=idempotency_key
+              )
+
+              task_id = task["task_id"]
+
+              print("PASS: Task created:", task_id)
+
+              # 2. Read using independent Manager B
+              retrieved = manager_b.get_task(task_id)
+
+              assert retrieved is not None
+              assert retrieved["task_id"] == task_id
+              assert retrieved["status"] == "PENDING"
+
+              print("PASS: Cross-instance task retrieval")
+
+              # 3. Verify idempotency
+              duplicate = manager_b.create_task(
+                  task_type="integration_test_worker",
+                  payload={"test_id": unique},
+                  idempotency_key=idempotency_key
+              )
+
+              assert duplicate["task_id"] == task_id
+
+              print("PASS: Idempotency")
+
+              # 4. Update status from Manager B
+              manager_b.update_status(task_id, "RUNNING")
+
+              running = manager_a.get_task(task_id)
+
+              assert running["status"] == "RUNNING"
+
+              print("PASS: Cross-instance status update to RUNNING")
+
+              manager_a.update_status(task_id, "SUCCESS")
+
+              completed = manager_b.get_task(task_id)
+
+              assert completed["status"] == "SUCCESS"
+
+              print("PASS: Cross-instance status update to SUCCESS")
+
+              # 5. Verify task listing
+              tasks = manager_b.list_tasks(status="SUCCESS")
+
+              assert any(
+                  item["task_id"] == task_id
+                  for item in tasks
+              )
+
+              print("PASS: Task listing")
+
+          finally:
+              # 6. Clean up test task
+              if task is not None:
+                  deleted = manager_a.delete_task(task["task_id"])
+                  assert deleted
+
+                  assert manager_b.get_task(task["task_id"]) is None
+
+                  print("PASS: Task cleanup")
+
+          print("ALL LIVE INTEGRATION CHECKS PASSED")
+          PY
+
+      - name: Compile Architecture
+        run: |
+          python -m compileall -q platform_core
+          echo "Compilation successful."
+
+      - name: Commit Integration Tests
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add tests/test_phase3c6c_task_queue.py
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Add Phase 3C-6C persistent task queue integration tests"
+            git push
+          else
+            echo "No changes to commit."
+          fi
+
+      - name: Final Result
+        run: |
+          echo "=================================="
+          echo "PHASE 3C-6C SUCCESS"
+          echo "Persistent Task Queue Integration"
+          echo "=================================="
