@@ -1,0 +1,425 @@
+name: Phase 3C-6B Python Storage Adapter
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase3c-6b-storage-adapter
+  cancel-in-progress: false
+
+jobs:
+  storage-adapter:
+    name: Build and Test Python Storage Adapter
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pytest==8.3.5
+
+      - name: Create Storage Package
+        run: |
+          mkdir -p platform_core/storage
+          mkdir -p tests
+
+          touch platform_core/__init__.py
+          touch platform_core/storage/__init__.py
+
+      - name: Create Apps Script Storage Adapter
+        run: |
+          cat > platform_core/storage/apps_script_storage.py <<'PY'
+          import requests
+
+
+          class AppsScriptStorage:
+              def __init__(self, url, token, timeout=45, session=None):
+                  if not url or not token:
+                      raise ValueError("URL and token are required")
+
+                  if not url.startswith("https://script.google.com/"):
+                      raise ValueError("Invalid Google Apps Script URL")
+
+                  self.url = url
+                  self.token = token
+                  self.timeout = timeout
+                  self.session = session or requests.Session()
+
+              def _request(self, action, key=None, value=None):
+                  payload = {
+                      "token": self.token,
+                      "action": action
+                  }
+
+                  if key is not None:
+                      payload["key"] = key
+
+                  if value is not None:
+                      payload["value"] = value
+
+                  try:
+                      response = self.session.post(
+                          self.url,
+                          json=payload,
+                          timeout=self.timeout,
+                          allow_redirects=True
+                      )
+
+                      response.raise_for_status()
+                      result = response.json()
+
+                  except requests.RequestException as exc:
+                      raise RuntimeError(
+                          f"Storage network error: {exc}"
+                      ) from exc
+
+                  except ValueError as exc:
+                      raise RuntimeError(
+                          "Storage API returned invalid JSON"
+                      ) from exc
+
+                  if not isinstance(result, dict):
+                      raise RuntimeError(
+                          "Storage API returned an invalid response"
+                      )
+
+                  if not result.get("success"):
+                      raise RuntimeError(
+                          result.get("error", "Storage API operation failed")
+                      )
+
+                  return result
+
+              def get(self, key):
+                  result = self._request("get", key=key)
+
+                  if not result.get("found"):
+                      return None
+
+                  return result.get("value")
+
+              def set(self, key, value):
+                  return self._request(
+                      "set",
+                      key=key,
+                      value=value
+                  )
+
+              def delete(self, key):
+                  return self._request(
+                      "delete",
+                      key=key
+                  )
+
+              def health_check(self):
+                  result = self._request("ping")
+                  return result.get("status") == "CONNECTED"
+          PY
+
+      - name: Create Storage Adapter Tests
+        run: |
+          cat > tests/test_phase3c6b_storage_adapter.py <<'PY'
+          import json
+          import pytest
+
+          from platform_core.storage.apps_script_storage import (
+              AppsScriptStorage
+          )
+
+
+          class FakeResponse:
+              def __init__(self, data, status_code=200):
+                  self.data = data
+                  self.status_code = status_code
+
+              def raise_for_status(self):
+                  if self.status_code >= 400:
+                      raise Exception("HTTP error")
+
+              def json(self):
+                  return self.data
+
+
+          class FakeSession:
+              def __init__(self):
+                  self.data = {}
+                  self.calls = []
+
+              def post(self, url, json, timeout, allow_redirects):
+                  self.calls.append(json)
+
+                  action = json["action"]
+                  key = json.get("key")
+
+                  if action == "ping":
+                      return FakeResponse({
+                          "success": True,
+                          "status": "CONNECTED"
+                      })
+
+                  if action == "set":
+                      self.data[key] = json.get("value")
+                      return FakeResponse({
+                          "success": True,
+                          "action": "SET",
+                          "key": key
+                      })
+
+                  if action == "get":
+                      if key not in self.data:
+                          return FakeResponse({
+                              "success": True,
+                              "found": False,
+                              "value": None
+                          })
+
+                      return FakeResponse({
+                          "success": True,
+                          "found": True,
+                          "value": self.data[key]
+                      })
+
+                  if action == "delete":
+                      self.data.pop(key, None)
+                      return FakeResponse({
+                          "success": True,
+                          "action": "DELETE",
+                          "key": key
+                      })
+
+                  return FakeResponse({
+                      "success": False,
+                      "error": "UNKNOWN_ACTION"
+                  })
+
+
+          def make_storage(session=None):
+              return AppsScriptStorage(
+                  url="https://script.google.com/macros/s/test/exec",
+                  token="test-token",
+                  session=session or FakeSession()
+              )
+
+
+          def test_constructor_requires_credentials():
+              with pytest.raises(ValueError):
+                  AppsScriptStorage("", "token")
+
+              with pytest.raises(ValueError):
+                  AppsScriptStorage(
+                      "https://script.google.com/macros/s/test/exec",
+                      ""
+                  )
+
+
+          def test_constructor_rejects_invalid_url():
+              with pytest.raises(ValueError):
+                  AppsScriptStorage(
+                      "https://example.com",
+                      "test-token"
+                  )
+
+
+          def test_health_check():
+              storage = make_storage()
+              assert storage.health_check() is True
+
+
+          def test_set_and_get():
+              storage = make_storage()
+
+              value = {
+                  "name": "AI Workflow",
+                  "status": "active",
+                  "count": 10
+              }
+
+              storage.set("test:key", value)
+
+              assert storage.get("test:key") == value
+
+
+          def test_missing_key_returns_none():
+              storage = make_storage()
+              assert storage.get("missing:key") is None
+
+
+          def test_update_existing_value():
+              storage = make_storage()
+
+              storage.set("test:key", {"version": 1})
+              storage.set("test:key", {"version": 2})
+
+              assert storage.get("test:key") == {"version": 2}
+
+
+          def test_delete():
+              storage = make_storage()
+
+              storage.set("test:key", {"value": 100})
+              storage.delete("test:key")
+
+              assert storage.get("test:key") is None
+
+
+          def test_separate_instances_share_same_backend():
+              session = FakeSession()
+
+              storage_a = make_storage(session)
+              storage_b = make_storage(session)
+
+              storage_a.set("shared:key", {"status": "saved"})
+
+              assert storage_b.get("shared:key") == {
+                  "status": "saved"
+              }
+
+
+          def test_failed_api_response():
+              class FailedSession:
+                  def post(self, *args, **kwargs):
+                      return FakeResponse({
+                          "success": False,
+                          "error": "UNAUTHORIZED"
+                      })
+
+              storage = make_storage(FailedSession())
+
+              with pytest.raises(RuntimeError, match="UNAUTHORIZED"):
+                  storage.get("test:key")
+
+
+          def test_adapter_sends_token():
+              session = FakeSession()
+              storage = make_storage(session)
+
+              storage.health_check()
+
+              assert session.calls[0]["token"] == "test-token"
+
+
+          def test_complex_json_values():
+              storage = make_storage()
+
+              value = {
+                  "tasks": [
+                      {"id": "task-1", "status": "PENDING"},
+                      {"id": "task-2", "status": "SUCCESS"}
+                  ],
+                  "metadata": {
+                      "retry_count": 3,
+                      "enabled": True
+                  }
+              }
+
+              storage.set("complex:key", value)
+
+              assert storage.get("complex:key") == value
+          PY
+
+      - name: Verify Python Package Paths
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          pwd
+          ls -la
+          ls -la platform_core
+          python -c "import sys; print(sys.path); import platform_core; print('Package import successful')"
+          python -c "from platform_core.storage.apps_script_storage import AppsScriptStorage; print('Storage adapter import successful')"
+
+      - name: Run Unit Tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m pytest -v tests/test_phase3c6b_storage_adapter.py
+
+      - name: Run Live Google Sheets Integration Test
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+          APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import uuid
+
+          from platform_core.storage.apps_script_storage import AppsScriptStorage
+
+          url = os.environ.get("APPS_SCRIPT_URL")
+          token = os.environ.get("APPS_SCRIPT_TOKEN")
+
+          if not url or not token:
+              raise RuntimeError("Google Apps Script GitHub Secrets are missing")
+
+          storage_a = AppsScriptStorage(url, token)
+          storage_b = AppsScriptStorage(url, token)
+
+          test_key = "phase3c6b:test:" + str(uuid.uuid4())
+
+          print("Checking API health...")
+          assert storage_a.health_check()
+
+          print("Testing write...")
+          storage_a.set(test_key, {
+              "status": "created",
+              "phase": "3C-6B"
+          })
+
+          print("Testing read from independent adapter...")
+          result = storage_b.get(test_key)
+
+          assert result == {
+              "status": "created",
+              "phase": "3C-6B"
+          }
+
+          print("Testing update...")
+          storage_b.set(test_key, {
+              "status": "updated",
+              "phase": "3C-6B"
+          })
+
+          assert storage_a.get(test_key)["status"] == "updated"
+
+          print("Testing delete...")
+          storage_a.delete(test_key)
+
+          assert storage_b.get(test_key) is None
+
+          print("LIVE GOOGLE SHEETS INTEGRATION TEST PASSED")
+          PY
+
+      - name: Compile Python Files
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m compileall -q platform_core tests
+          echo "Python compilation successful"
+
+      - name: Commit Storage Adapter
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add platform_core/storage/apps_script_storage.py
+          git add platform_core/storage/__init__.py
+          git add tests/test_phase3c6b_storage_adapter.py
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Add Phase 3C-6B Apps Script Python storage adapter"
+            git push
+          fi
