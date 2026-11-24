@@ -114,7 +114,7 @@ jobs:
                           f"Worker not registered: {worker_id}"
                       )
 
-                  # BaseWorker defaults to full_task.
+                  # Modern BaseWorker defaults to full_task.
                   # Legacy workers default to payload.
                   input_mode = getattr(
                       worker,
@@ -124,7 +124,6 @@ jobs:
 
                   if input_mode == "payload":
                       payload = task.get("payload") or {}
-
                       return payload.get("data", {})
 
                   if input_mode == "full_task":
@@ -172,7 +171,6 @@ jobs:
                           worker_input
                       )
 
-                      # Preserve result in lifecycle history.
                       self.lifecycle.mark_success(
                           task_id,
                           details={
@@ -180,8 +178,6 @@ jobs:
                           }
                       )
 
-                      # Preserve the original ExecutionOrchestrator
-                      # response structure.
                       return {
                           "task_id": task_id,
                           "status": "SUCCESS",
@@ -207,7 +203,6 @@ jobs:
                           }
                       )
 
-                      # Internal lifecycle remains RETRY.
                       return self.retry_controller.handle_failure(
                           task_id,
                           error=str(exc)
@@ -235,9 +230,13 @@ jobs:
                   return self._execute_running_task(task)
 
               def process_pending_tasks(self, max_tasks=100):
-                  if max_tasks < 1:
+                  if (
+                      not isinstance(max_tasks, int)
+                      or isinstance(max_tasks, bool)
+                      or max_tasks < 1
+                  ):
                       raise ValueError(
-                          "max_tasks must be positive"
+                          "max_tasks must be a positive integer"
                       )
 
                   results = []
@@ -302,55 +301,29 @@ jobs:
           from pathlib import Path
 
           path = Path("platform_core/runtime.py")
-          source = path.read_text()
+          source = path.read_text(encoding="utf-8")
 
-          old = '''        result = self.execution_engine.execute_task(
-              task_id
+          old = "        result = self.execution_engine.execute_task(task_id)\n"
+
+          new = (
+              old
+              + '        if result.get("status") == "RETRY":\n'
+              + '            result = {**result, "execution_status": "RETRY", "status": "FAILED"}\n'
           )
 
-          if result["status"] == "SUCCESS":
-              self.metrics["tasks_completed"] += 1
-          else:
-              self.metrics["tasks_failed"] += 1
+          count = source.count(old)
 
-          self.save_state()
-
-          return result
-          '''
-
-          new = '''        result = self.execution_engine.execute_task(
-              task_id
-          )
-
-          # Preserve legacy Runtime API behavior.
-          # The persistent task lifecycle still remains RETRY.
-          if result["status"] == "RETRY":
-              result = {
-                  **result,
-                  "execution_status": "RETRY",
-                  "status": "FAILED",
-              }
-
-          if result["status"] == "SUCCESS":
-              self.metrics["tasks_completed"] += 1
-          else:
-              self.metrics["tasks_failed"] += 1
-
-          self.save_state()
-
-          return result
-          '''
-
-          if old not in source:
+          if count != 1:
               raise RuntimeError(
-                  "Runtime execute_task block does not match "
-                  "the expected original implementation. "
-                  "No automatic replacement was performed."
+                  f"Expected exactly one Runtime execute_task call, "
+                  f"found {count}. No automatic replacement was performed."
               )
 
-          path.write_text(source.replace(old, new, 1))
+          source = source.replace(old, new, 1)
 
-          print("Runtime compatibility updated.")
+          path.write_text(source, encoding="utf-8")
+
+          print("Runtime compatibility updated successfully.")
           PY
 
       # --------------------------------------------------
