@@ -1,0 +1,565 @@
+name: Phase 3C-7 Persistent Runtime Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase3c-7-runtime-integration
+  cancel-in-progress: false
+
+jobs:
+  runtime-integration:
+    runs-on: ubuntu-latest
+
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+      GOOGLE_APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pytest==8.3.5
+
+      - name: Verify Architecture Files
+        run: |
+          test -f platform_core/architecture_initializer.py
+          test -f platform_core/runtime.py
+          test -f platform_core/orchestrator.py
+          test -f platform_core/contracts/base_worker.py
+          test -f platform_core/plugin_system/worker_manager.py
+          test -f platform_core/execution/execution_engine.py
+          test -f platform_core/task_queue/persistent_task_manager.py
+          test -f platform_core/task_queue/task_lifecycle_manager.py
+          test -f platform_core/task_queue/retry_controller.py
+          test -f platform_core/task_queue/recovery_controller.py
+          test -f platform_core/storage/apps_script_storage.py
+
+          echo "All required files found."
+
+      - name: Integrate Persistent Architecture Initializer
+        run: |
+          cat > platform_core/architecture_initializer.py <<'PY'
+          from platform_core.plugin_system.worker_registry import WorkerRegistry
+          from platform_core.plugin_system.worker_manager import WorkerManager
+          from platform_core.task_queue.task_manager import TaskManager
+          from platform_core.task_queue.persistent_task_manager import PersistentTaskManager
+          from platform_core.event_system.event_bus import EventBus
+
+
+          class ArchitectureInitializer:
+
+              def initialize(self, task_storage=None):
+                  registry = WorkerRegistry()
+                  manager = WorkerManager()
+
+                  if task_storage is not None:
+                      tasks = PersistentTaskManager(task_storage)
+                  else:
+                      tasks = TaskManager()
+
+                  events = EventBus()
+
+                  registry.discover()
+
+                  return {
+                      "worker_registry": registry,
+                      "worker_manager": manager,
+                      "task_manager": tasks,
+                      "event_bus": events
+                  }
+          PY
+
+      - name: Integrate Persistent Runtime
+        run: |
+          cat > platform_core/runtime.py <<'PY'
+          from platform_core.architecture_initializer import ArchitectureInitializer
+          from platform_core.storage.memory_storage import InMemoryStorage
+          from platform_core.persistence.checkpoint_manager import CheckpointManager
+          from platform_core.persistence.state_loader import StateLoader
+          from platform_core.monitoring.health_monitor import HealthMonitor
+          from platform_core.monitoring.system_reporter import SystemReporter
+          from platform_core.orchestrator import ExecutionOrchestrator
+
+          from platform_core.task_queue.task_lifecycle_manager import TaskLifecycleManager
+          from platform_core.task_queue.retry_controller import RetryController
+          from platform_core.task_queue.recovery_controller import RecoveryController
+          from platform_core.execution.execution_engine import ExecutionEngine
+
+
+          class WorkerHealthProbe:
+
+              def __init__(self, worker_manager, worker_id):
+                  self.worker_manager = worker_manager
+                  self.worker_id = worker_id
+
+              def health_check(self):
+                  try:
+                      return self.worker_manager.health_check(
+                          self.worker_id
+                      )
+                  except Exception:
+                      return False
+
+
+          class ArchitectureRuntime:
+
+              def __init__(self, storage=None):
+                  self.storage = storage or InMemoryStorage()
+                  self.initialized = False
+
+              def initialize(self):
+                  if self.initialized:
+                      return self.components
+
+                  self.components = ArchitectureInitializer().initialize(
+                      task_storage=self.storage
+                  )
+
+                  self.worker_registry = self.components[
+                      "worker_registry"
+                  ]
+
+                  self.worker_manager = self.components[
+                      "worker_manager"
+                  ]
+
+                  self.task_manager = self.components[
+                      "task_manager"
+                  ]
+
+                  self.event_bus = self.components[
+                      "event_bus"
+                  ]
+
+                  self.checkpoints = CheckpointManager(
+                      self.storage,
+                      namespace="architecture",
+                  )
+
+                  self.state_loader = StateLoader(
+                      self.checkpoints
+                  )
+
+                  self.health_monitor = HealthMonitor()
+                  self.reporter = SystemReporter()
+
+                  self.lifecycle_manager = TaskLifecycleManager(
+                      self.task_manager
+                  )
+
+                  self.retry_controller = RetryController(
+                      self.task_manager
+                  )
+
+                  self.recovery_controller = RecoveryController(
+                      task_manager=self.task_manager,
+                      lifecycle_manager=self.lifecycle_manager,
+                      retry_controller=self.retry_controller,
+                  )
+
+                  self.execution_engine = ExecutionEngine(
+                      task_manager=self.task_manager,
+                      lifecycle_manager=self.lifecycle_manager,
+                      retry_controller=self.retry_controller,
+                      worker_manager=self.worker_manager,
+                  )
+
+                  self.orchestrator = ExecutionOrchestrator(
+                      self.worker_manager,
+                      self.task_manager,
+                      self.checkpoints,
+                  )
+
+                  self.previous_state = self.state_loader.restore(
+                      "runtime"
+                  )
+
+                  self.metrics = (
+                      self.previous_state.get("metrics", {})
+                      if self.previous_state
+                      else {
+                          "tasks_completed": 0,
+                          "tasks_failed": 0
+                      }
+                  )
+
+                  self.initialized = True
+
+                  return self.components
+
+              def register_worker(self, worker_id, worker, context=None):
+                  self._require_initialized()
+
+                  result = self.orchestrator.register_worker(
+                      worker_id, worker, context
+                  )
+
+                  probe = WorkerHealthProbe(
+                      self.worker_manager,
+                      worker_id
+                  )
+
+                  self.health_monitor.register(
+                      f"worker:{worker_id}",
+                      probe
+                  )
+
+                  return result
+
+              def submit_task(self, worker_id, payload=None, priority=5):
+                  self._require_initialized()
+
+                  return self.orchestrator.create_task(
+                      worker_id,
+                      payload,
+                      priority
+                  )
+
+              def execute_task(self, task_id):
+                  self._require_initialized()
+
+                  result = self.execution_engine.execute_task(
+                      task_id
+                  )
+
+                  if result["status"] == "SUCCESS":
+                      self.metrics["tasks_completed"] += 1
+                  else:
+                      self.metrics["tasks_failed"] += 1
+
+                  self.save_state()
+
+                  return result
+
+              def run_once(self, max_tasks=100):
+                  self._require_initialized()
+
+                  recovery_results = (
+                      self.recovery_controller.recover_stale_tasks()
+                  )
+
+                  execution_results = self.execution_engine.run_once(
+                      max_tasks=max_tasks
+                  )
+
+                  return {
+                      "recovery_results": recovery_results,
+                      "execution_results": execution_results,
+                  }
+
+              def save_state(self):
+                  self._require_initialized()
+
+                  state = {
+                      "metrics": self.metrics,
+                      "worker_ids": list(
+                          self.worker_manager.workers.keys()
+                      ),
+                  }
+
+                  return self.checkpoints.save(
+                      "runtime",
+                      state
+                  )
+
+              def health_report(self):
+                  self._require_initialized()
+
+                  results = self.health_monitor.check_all()
+
+                  return self.reporter.generate(results)
+
+              def shutdown(self):
+                  if not self.initialized:
+                      return
+
+                  self.save_state()
+
+                  for worker_id in list(
+                      self.worker_manager.workers.keys()
+                  ):
+                      if self.worker_manager.status.get(
+                          worker_id
+                      ) == "READY":
+                          self.worker_manager.stop(worker_id)
+
+                  self.initialized = False
+
+              def _require_initialized(self):
+                  if not self.initialized:
+                      raise RuntimeError(
+                          "Architecture Runtime is not initialized"
+                      )
+          PY
+
+      - name: Create Runtime Integration Tests
+        run: |
+          mkdir -p tests
+
+          cat > tests/test_phase3c7_runtime.py <<'PY'
+          from platform_core.runtime import ArchitectureRuntime
+          from platform_core.storage.memory_storage import InMemoryStorage
+          from platform_core.task_queue.persistent_task_manager import PersistentTaskManager
+          from platform_core.contracts.base_worker import BaseWorker
+
+
+          class DemoWorker(BaseWorker):
+
+              name = "demo-worker"
+
+              def initialize(self, context):
+                  self.initialized = True
+
+              def execute(self, task):
+                  return {
+                      "received_task_id": task["task_id"],
+                      "received_payload": task["payload"],
+                      "success": True
+                  }
+
+              def health_check(self):
+                  return True
+
+
+          def test_runtime_uses_persistent_task_manager():
+              runtime = ArchitectureRuntime(
+                  storage=InMemoryStorage()
+              )
+
+              runtime.initialize()
+
+              assert isinstance(
+                  runtime.task_manager,
+                  PersistentTaskManager
+              )
+
+              runtime.shutdown()
+
+
+          def test_runtime_register_submit_execute():
+              runtime = ArchitectureRuntime(
+                  storage=InMemoryStorage()
+              )
+
+              runtime.initialize()
+
+              try:
+                  runtime.register_worker(
+                      "demo_worker",
+                      DemoWorker()
+                  )
+
+                  task = runtime.submit_task(
+                      "demo_worker",
+                      payload={"message": "hello"},
+                      priority=1
+                  )
+
+                  assert task["status"] == "PENDING"
+
+                  result = runtime.execute_task(
+                      task["task_id"]
+                  )
+
+                  assert result["status"] == "SUCCESS"
+
+                  saved = runtime.task_manager.get_task(
+                      task["task_id"]
+                  )
+
+                  assert saved["status"] == "SUCCESS"
+                  assert saved["completed_at"]
+
+                  assert runtime.metrics["tasks_completed"] == 1
+
+              finally:
+                  runtime.shutdown()
+
+
+          def test_runtime_preserves_legacy_initializer_mode():
+              from platform_core.architecture_initializer import ArchitectureInitializer
+              from platform_core.task_queue.task_manager import TaskManager
+
+              components = ArchitectureInitializer().initialize()
+
+              assert isinstance(
+                  components["task_manager"],
+                  TaskManager
+              )
+
+
+          def test_runtime_requires_initialization():
+              runtime = ArchitectureRuntime()
+
+              try:
+                  runtime.submit_task("demo_worker")
+                  assert False
+              except RuntimeError:
+                  pass
+          PY
+
+      - name: Run Integration Unit Tests
+        run: |
+          python -m pytest -v tests/test_phase3c7_runtime.py
+
+      - name: Live Google Sheets Runtime Test
+        run: |
+          python - <<'PY'
+          import os
+          import uuid
+
+          from platform_core.runtime import ArchitectureRuntime
+          from platform_core.storage.apps_script_storage import AppsScriptStorage
+          from platform_core.task_queue.persistent_task_manager import PersistentTaskManager
+          from platform_core.contracts.base_worker import BaseWorker
+
+          url = os.environ["GOOGLE_APPS_SCRIPT_URL"]
+          token = os.environ["GOOGLE_APPS_SCRIPT_TOKEN"]
+
+          storage = AppsScriptStorage(url, token)
+
+          assert storage.health_check()
+
+          runtime = ArchitectureRuntime(storage=storage)
+
+          worker_id = "phase3c7_" + uuid.uuid4().hex[:12]
+
+          class LiveWorker(BaseWorker):
+
+              name = "phase3c7-live-worker"
+
+              def initialize(self, context):
+                  self.ready = True
+
+              def execute(self, task):
+                  return {
+                      "success": True,
+                      "task_id": task["task_id"],
+                      "validation": "google_sheets_runtime"
+                  }
+
+              def health_check(self):
+                  return True
+
+          task = None
+
+          try:
+              runtime.initialize()
+
+              assert isinstance(
+                  runtime.task_manager,
+                  PersistentTaskManager
+              )
+
+              print("PASS: Runtime uses PersistentTaskManager")
+
+              runtime.register_worker(
+                  worker_id,
+                  LiveWorker()
+              )
+
+              print("PASS: Worker registered")
+
+              task = runtime.submit_task(
+                  worker_id,
+                  payload={
+                      "validation_id": uuid.uuid4().hex
+                  },
+                  priority=1
+              )
+
+              print("PASS: Task submitted")
+
+              result = runtime.execute_task(
+                  task["task_id"]
+              )
+
+              assert result["status"] == "SUCCESS"
+
+              print("PASS: Execution Engine completed task")
+
+              independent_storage = AppsScriptStorage(
+                  url,
+                  token
+              )
+
+              independent_manager = PersistentTaskManager(
+                  independent_storage
+              )
+
+              persisted = independent_manager.get_task(
+                  task["task_id"]
+              )
+
+              assert persisted is not None
+              assert persisted["status"] == "SUCCESS"
+
+              print("PASS: Task persisted in Google Sheets")
+              print("PASS: Independent Manager retrieved task")
+
+              assert runtime.metrics["tasks_completed"] >= 1
+
+              print("PASS: Runtime metrics updated")
+
+          finally:
+              runtime.shutdown()
+
+              if task is not None:
+                  cleanup_storage = AppsScriptStorage(
+                      url,
+                      token
+                  )
+
+                  cleanup_manager = PersistentTaskManager(
+                      cleanup_storage
+                  )
+
+                  cleanup_manager.delete_task(
+                      task["task_id"]
+                  )
+
+                  print("PASS: Integration test task cleaned up")
+
+          print("ALL LIVE RUNTIME TESTS PASSED")
+          PY
+
+      - name: Compile Architecture
+        run: |
+          python -m compileall -q platform_core
+          echo "Architecture compilation successful."
+
+      - name: Commit Integration Changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add platform_core/architecture_initializer.py
+          git add platform_core/runtime.py
+          git add tests/test_phase3c7_runtime.py
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Integrate persistent execution engine with architecture runtime"
+            git push
+          else
+            echo "No changes to commit."
+          fi
+
+      - name: Final Result
+        run: |
+          echo "======================================"
+          echo "PHASE 3C-7 SUCCESS"
+          echo "Persistent Runtime Integration"
+          echo "======================================"
