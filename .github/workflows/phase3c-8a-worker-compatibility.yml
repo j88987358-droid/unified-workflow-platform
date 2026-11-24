@@ -28,73 +28,204 @@ jobs:
         run: |
           test -f platform_core/execution/execution_engine.py
           test -f platform_core/plugin_system/worker_manager.py
+          echo "Required files verified."
 
-      - name: Add Worker Input Compatibility
+      - name: Implement Worker Compatibility
         run: |
-          python - <<'PY'
-          from pathlib import Path
+          cat > platform_core/execution/execution_engine.py <<'PY'
+          class ExecutionEngine:
 
-          path = Path("platform_core/execution/execution_engine.py")
-          source = path.read_text(encoding="utf-8")
+              def __init__(
+                  self,
+                  task_manager,
+                  lifecycle_manager,
+                  retry_controller,
+                  worker_manager,
+              ):
+                  if task_manager is None:
+                      raise ValueError("TaskManager required")
 
-          marker = "    def _execute_running_task(self, task):"
+                  if lifecycle_manager is None:
+                      raise ValueError("LifecycleManager required")
 
-          method = '''    def _get_worker_input(self, worker_id, task):
-              worker = self.worker_manager.workers.get(worker_id)
+                  if retry_controller is None:
+                      raise ValueError("RetryController required")
 
-              if worker is None:
-                  raise KeyError(f"Worker not registered: {worker_id}")
+                  if worker_manager is None:
+                      raise ValueError("WorkerManager required")
 
-              input_mode = getattr(worker, "task_input_mode", "payload")
+                  self.task_manager = task_manager
+                  self.lifecycle = lifecycle_manager
+                  self.retry_controller = retry_controller
+                  self.worker_manager = worker_manager
 
-              if input_mode == "payload":
+              def _get_worker_id(self, task):
                   payload = task.get("payload") or {}
-                  return payload.get("data", {})
 
-              if input_mode == "full_task":
-                  return task
+                  worker_id = payload.get("worker_id")
 
-              raise ValueError(
-                  f"Unsupported task_input_mode for {worker_id}: {input_mode}"
-              )
+                  if not worker_id:
+                      worker_id = task.get("task_type")
 
-          '''
+                  if not worker_id:
+                      raise ValueError("Task has no worker_id")
 
-          if "def _get_worker_input(self, worker_id, task):" not in source:
-              if source.count(marker) != 1:
-                  raise RuntimeError("Execution method marker mismatch.")
+                  return worker_id
 
-              source = source.replace(marker, method + marker, 1)
+              def _get_worker_input(self, worker_id, task):
+                  worker = self.worker_manager.workers.get(worker_id)
 
-          old = '''            result = self.worker_manager.execute(
-                  worker_id,
-                  task,
-              )
-          '''
+                  if worker is None:
+                      raise KeyError(
+                          f"Worker not registered: {worker_id}"
+                      )
 
-          new = '''            worker_input = self._get_worker_input(worker_id, task)
+                  input_mode = getattr(
+                      worker,
+                      "task_input_mode",
+                      "payload"
+                  )
 
-              result = self.worker_manager.execute(
-                  worker_id,
-                  worker_input,
-              )
-          '''
+                  if input_mode == "payload":
+                      payload = task.get("payload") or {}
+                      return payload.get("data", {})
 
-          if old in source:
-              source = source.replace(old, new, 1)
-          elif new not in source:
-              raise RuntimeError(
-                  "Worker execution block does not match expected code."
-              )
+                  if input_mode == "full_task":
+                      return task
 
-          path.write_text(source, encoding="utf-8")
-          print("Worker compatibility successfully implemented.")
+                  raise ValueError(
+                      f"Unsupported task_input_mode for {worker_id}: "
+                      f"{input_mode}"
+                  )
+
+              def _ensure_worker_ready(self, worker_id):
+                  if worker_id not in self.worker_manager.workers:
+                      raise KeyError(
+                          f"Worker not registered: {worker_id}"
+                      )
+
+                  status = self.worker_manager.status.get(worker_id)
+
+                  if status != "READY":
+                      self.worker_manager.start(worker_id)
+
+                  if not self.worker_manager.health_check(worker_id):
+                      raise RuntimeError(
+                          f"Worker unhealthy: {worker_id}"
+                      )
+
+              def _execute_running_task(self, task):
+                  task_id = task["task_id"]
+
+                  try:
+                      worker_id = self._get_worker_id(task)
+
+                      self._ensure_worker_ready(worker_id)
+
+                      worker_input = self._get_worker_input(
+                          worker_id,
+                          task
+                      )
+
+                      result = self.worker_manager.execute(
+                          worker_id,
+                          worker_input,
+                      )
+
+                      return self.lifecycle.mark_success(
+                          task_id,
+                          details={
+                              "result": result,
+                          },
+                      )
+
+                  except Exception as exc:
+                      current = self.task_manager.get_task(task_id)
+
+                      if current["status"] != "RUNNING":
+                          raise
+
+                      self.lifecycle.mark_failed(
+                          task_id,
+                          details={
+                              "error": str(exc),
+                          },
+                      )
+
+                      return self.retry_controller.handle_failure(
+                          task_id,
+                          error=str(exc),
+                      )
+
+              def execute_task(self, task_id):
+                  task = self.task_manager.get_task(task_id)
+
+                  if task is None:
+                      raise KeyError(task_id)
+
+                  if task["status"] == "PENDING":
+                      task = self.lifecycle.mark_running(task_id)
+
+                  elif task["status"] != "RUNNING":
+                      raise ValueError(
+                          f"Task cannot execute from status "
+                          f"{task['status']}"
+                      )
+
+                  return self._execute_running_task(task)
+
+              def process_pending_tasks(self, max_tasks=100):
+                  if max_tasks < 1:
+                      raise ValueError(
+                          "max_tasks must be positive"
+                      )
+
+                  results = []
+
+                  for _ in range(max_tasks):
+                      task = self.task_manager.get_next_pending_task()
+
+                      if task is None:
+                          break
+
+                      result = self.execute_task(task["task_id"])
+                      results.append(result)
+
+                  return results
+
+              def process_due_retries(self):
+                  due_tasks = (
+                      self.retry_controller.process_due_retries()
+                  )
+
+                  results = []
+
+                  for task in due_tasks:
+                      result = self._execute_running_task(task)
+                      results.append(result)
+
+                  return results
+
+              def run_once(self, max_tasks=100):
+                  return {
+                      "pending_results": self.process_pending_tasks(
+                          max_tasks=max_tasks
+                      ),
+                      "retry_results": self.process_due_retries(),
+                  }
           PY
 
-      - name: Create Compatibility Tests
+          python -m py_compile platform_core/execution/execution_engine.py
+
+      - name: Create Worker Compatibility Tests
         run: |
+          mkdir -p tests
+
           cat > tests/test_phase3c8a_worker_compatibility.py <<'PY'
+          import pytest
+
           from platform_core.execution.execution_engine import ExecutionEngine
+
 
           TASK = {
               "task_id": "test-001",
@@ -109,31 +240,65 @@ jobs:
               }
           }
 
+
           class LegacyWorker:
-              pass
+              def initialize(self, context):
+                  pass
+
+              def execute(self, task):
+                  return {"received": task}
+
+              def health_check(self):
+                  return True
+
 
           class NewWorker:
               task_input_mode = "full_task"
 
+              def initialize(self, context):
+                  pass
+
+              def execute(self, task):
+                  return {"received": task}
+
+              def health_check(self):
+                  return True
+
+
           class WorkerManager:
               def __init__(self, worker):
-                  self.workers = {"test_worker": worker}
-                  self.status = {"test_worker": "READY"}
+                  self.workers = {
+                      "test_worker": worker
+                  }
+
+                  self.status = {
+                      "test_worker": "READY"
+                  }
+
                   self.received_input = None
 
               def health_check(self, worker_id):
-                  return True
+                  return self.workers[worker_id].health_check()
 
               def start(self, worker_id):
+                  self.workers[worker_id].initialize({})
                   self.status[worker_id] = "READY"
 
               def execute(self, worker_id, task_input):
                   self.received_input = task_input
-                  return {"success": True}
+
+                  return self.workers[worker_id].execute(
+                      task_input
+                  )
+
 
           class TaskManager:
               def get_task(self, task_id):
-                  return TASK.copy()
+                  if task_id == TASK["task_id"]:
+                      return TASK.copy()
+
+                  return None
+
 
           class LifecycleManager:
               def mark_success(self, task_id, details=None):
@@ -144,43 +309,82 @@ jobs:
                   }
 
               def mark_failed(self, task_id, details=None):
-                  return {"task_id": task_id, "status": "FAILED"}
+                  return {
+                      "task_id": task_id,
+                      "status": "FAILED",
+                      "details": details
+                  }
+
+              def mark_running(self, task_id):
+                  result = TASK.copy()
+                  result["status"] = "RUNNING"
+                  return result
+
+
+          class RetryController:
+              def handle_failure(self, task_id, error=None):
+                  return {
+                      "task_id": task_id,
+                      "status": "RETRY",
+                      "error": error
+                  }
+
+              def process_due_retries(self):
+                  return []
+
 
           def build_engine(worker):
-              engine = ExecutionEngine.__new__(ExecutionEngine)
-              engine.worker_manager = WorkerManager(worker)
-              engine.task_manager = TaskManager()
-              engine.lifecycle = LifecycleManager()
-              engine.retry_controller = None
-              return engine
+              return ExecutionEngine(
+                  task_manager=TaskManager(),
+                  lifecycle_manager=LifecycleManager(),
+                  retry_controller=RetryController(),
+                  worker_manager=WorkerManager(worker),
+              )
+
 
           def test_legacy_worker_receives_payload_data():
               engine = build_engine(LegacyWorker())
+
               result = engine._execute_running_task(TASK)
 
               assert result["status"] == "SUCCESS"
-              assert engine.worker_manager.received_input == TASK["payload"]["data"]
+
+              assert engine.worker_manager.received_input == {
+                  "business": "HVAC Contractor",
+                  "location": "Tampa"
+              }
+
 
           def test_new_worker_receives_full_task():
               engine = build_engine(NewWorker())
+
               result = engine._execute_running_task(TASK)
 
               assert result["status"] == "SUCCESS"
               assert engine.worker_manager.received_input == TASK
 
+
           def test_payload_mode_is_default():
               engine = build_engine(LegacyWorker())
 
-              assert engine._get_worker_input(
-                  "test_worker", TASK
-              ) == TASK["payload"]["data"]
+              result = engine._get_worker_input(
+                  "test_worker",
+                  TASK
+              )
+
+              assert result == TASK["payload"]["data"]
+
 
           def test_full_task_mode_is_explicit():
               engine = build_engine(NewWorker())
 
-              assert engine._get_worker_input(
-                  "test_worker", TASK
-              ) == TASK
+              result = engine._get_worker_input(
+                  "test_worker",
+                  TASK
+              )
+
+              assert result == TASK
+
 
           def test_unknown_input_mode_is_rejected():
               class InvalidWorker:
@@ -188,20 +392,61 @@ jobs:
 
               engine = build_engine(InvalidWorker())
 
-              try:
-                  engine._get_worker_input("test_worker", TASK)
-              except ValueError:
-                  return
+              with pytest.raises(ValueError):
+                  engine._get_worker_input(
+                      "test_worker",
+                      TASK
+                  )
 
-              raise AssertionError("Unknown input mode was not rejected.")
 
+          def test_unregistered_worker_is_rejected():
+              engine = build_engine(LegacyWorker())
+
+              with pytest.raises(KeyError):
+                  engine._get_worker_input(
+                      "missing_worker",
+                      TASK
+                  )
+
+
+          def test_worker_id_is_read_from_payload():
+              engine = build_engine(LegacyWorker())
+
+              assert engine._get_worker_id(TASK) == "test_worker"
+
+
+          def test_worker_id_falls_back_to_task_type():
+              engine = build_engine(LegacyWorker())
+
+              task = {
+                  "task_type": "test_worker",
+                  "payload": {}
+              }
+
+              assert engine._get_worker_id(task) == "test_worker"
+
+
+          def test_missing_worker_id_is_rejected():
+              engine = build_engine(LegacyWorker())
+
+              with pytest.raises(ValueError):
+                  engine._get_worker_id({
+                      "payload": {}
+                  })
           PY
 
-      - name: Run Compatibility Tests
+      - name: Run Phase 3C-8A Tests
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m pytest -q tests/test_phase3c8a_worker_compatibility.py
+          python -m pytest -v tests/test_phase3c8a_worker_compatibility.py
+
+      - name: Run Existing Platform Tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m pytest -q tests/ \
+            --ignore=tests/test_phase3c8a_worker_compatibility.py
 
       - name: Compile Platform
         run: |
@@ -215,6 +460,7 @@ jobs:
           git add platform_core/execution/execution_engine.py
           git add tests/test_phase3c8a_worker_compatibility.py
 
-          git diff --cached --quiet || git commit -m "Add worker input compatibility"
+          git diff --cached --quiet || \
+            git commit -m "Add legacy and new worker compatibility"
 
           git push
