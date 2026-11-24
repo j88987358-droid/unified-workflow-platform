@@ -1,0 +1,294 @@
+name: Phase 3C-6D Cross-Run Persistence and Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Select persistence validation stage"
+        required: true
+        type: choice
+        options:
+          - seed
+          - recover
+          - verify
+        default: seed
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase3c-6d-cross-run-validation
+  cancel-in-progress: false
+
+jobs:
+  cross-run-validation:
+    runs-on: ubuntu-latest
+
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+      GOOGLE_APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
+      VALIDATION_MODE: ${{ inputs.mode }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pytest==8.3.5
+
+      - name: Verify Architecture Files
+        run: |
+          test -f platform_core/storage/apps_script_storage.py
+          test -f platform_core/task_queue/persistent_task_manager.py
+          test -f platform_core/task_queue/task_lifecycle_manager.py
+          test -f platform_core/task_queue/retry_controller.py
+          test -f platform_core/task_queue/recovery_controller.py
+
+          echo "All required architecture files found."
+
+      - name: Cross-Run Persistence and Recovery Test
+        run: |
+          python - <<'PY'
+          import os
+          import uuid
+          from datetime import datetime, timezone, timedelta
+
+          from platform_core.storage.apps_script_storage import AppsScriptStorage
+          from platform_core.task_queue.persistent_task_manager import PersistentTaskManager
+          from platform_core.task_queue.task_lifecycle_manager import TaskLifecycleManager
+          from platform_core.task_queue.retry_controller import RetryController
+          from platform_core.task_queue.recovery_controller import RecoveryController
+
+          mode = os.environ["VALIDATION_MODE"]
+
+          storage = AppsScriptStorage(
+              os.environ["GOOGLE_APPS_SCRIPT_URL"],
+              os.environ["GOOGLE_APPS_SCRIPT_TOKEN"]
+          )
+
+          assert storage.health_check()
+          print("PASS: Google Sheets connection")
+
+          manager = PersistentTaskManager(storage)
+
+          manifest_key = "phase3c6d:cross_run_manifest"
+
+          if mode == "seed":
+
+              unique_id = uuid.uuid4().hex
+
+              task = manager.create_task(
+                  task_type="cross_run_recovery_test",
+                  payload={
+                      "validation_id": unique_id,
+                      "purpose": "cross-run persistence validation"
+                  },
+                  priority=1,
+                  idempotency_key=f"phase3c6d-{unique_id}"
+              )
+
+              task_id = task["task_id"]
+
+              lifecycle = TaskLifecycleManager(manager)
+
+              lifecycle.mark_running(task_id)
+
+              # Simulate an interrupted task by aging its start time.
+              data = storage.get(manager.STORAGE_KEY)
+              old_time = (
+                  datetime.now(timezone.utc)
+                  - timedelta(minutes=30)
+              ).isoformat()
+
+              data["tasks"][task_id]["started_at"] = old_time
+              data["tasks"][task_id]["updated_at"] = old_time
+
+              storage.set(manager.STORAGE_KEY, data)
+
+              storage.set(manifest_key, {
+                  "task_id": task_id,
+                  "validation_id": unique_id,
+                  "created_at": datetime.now(timezone.utc).isoformat()
+              })
+
+              saved = manager.get_task(task_id)
+
+              assert saved["status"] == "RUNNING"
+
+              print("PASS: Task created and persisted")
+              print("Task ID:", task_id)
+              print("PASS: Task left in interrupted RUNNING state")
+              print("SEED STAGE SUCCESS")
+
+          elif mode == "recover":
+
+              manifest = storage.get(manifest_key)
+
+              assert manifest, (
+                  "No seed manifest found. Run seed stage first."
+              )
+
+              task_id = manifest["task_id"]
+
+              task = manager.get_task(task_id)
+
+              assert task is not None, "Persisted task not found"
+              assert task["status"] == "RUNNING"
+
+              print("PASS: Task retrieved from previous GitHub run")
+              print("Task ID:", task_id)
+
+              lifecycle = TaskLifecycleManager(manager)
+
+              retry_controller = RetryController(
+                  manager,
+                  max_retries=3,
+                  base_delay_seconds=60,
+                  max_delay_seconds=3600
+              )
+
+              recovery = RecoveryController(
+                  task_manager=manager,
+                  lifecycle_manager=lifecycle,
+                  retry_controller=retry_controller,
+                  stale_after_seconds=1
+              )
+
+              stale_tasks = recovery.find_stale_tasks()
+
+              assert any(
+                  item["task_id"] == task_id
+                  for item in stale_tasks
+              ), "Expected stale task was not detected"
+
+              print("PASS: Stale task detected")
+
+              results = recovery.recover_task(task_id)
+
+              assert results is not None
+              assert results["status"] == "RETRY"
+              assert results["retry_count"] == 1
+
+              persisted = manager.get_task(task_id)
+
+              assert persisted["status"] == "RETRY"
+              assert persisted["retry_count"] == 1
+              assert persisted["next_retry_at"]
+
+              events = recovery.get_recovery_history(task_id)
+
+              assert any(
+                  event["event_type"] == "RECOVERY_STARTED"
+                  for event in events
+              )
+
+              assert any(
+                  event["event_type"] == "RECOVERY_COMPLETED"
+                  for event in events
+              )
+
+              print("PASS: Recovery executed")
+              print("PASS: Retry count persisted")
+              print("PASS: Next retry time persisted")
+              print("PASS: Recovery history persisted")
+              print("RECOVERY STAGE SUCCESS")
+
+          elif mode == "verify":
+
+              manifest = storage.get(manifest_key)
+
+              assert manifest, (
+                  "Manifest missing. Run seed and recover first."
+              )
+
+              task_id = manifest["task_id"]
+
+              task = manager.get_task(task_id)
+
+              assert task is not None
+              assert task["status"] == "RETRY"
+              assert task["retry_count"] == 1
+              assert task["next_retry_at"]
+
+              print("PASS: Task survived previous GitHub runs")
+              print("PASS: RETRY status persisted")
+              print("PASS: Retry count persisted")
+              print("PASS: Next retry timestamp persisted")
+
+              lifecycle = TaskLifecycleManager(manager)
+
+              history = lifecycle.get_history(task_id)
+
+              assert any(
+                  event["to_status"] == "RUNNING"
+                  for event in history
+              )
+
+              assert any(
+                  event["to_status"] == "FAILED"
+                  for event in history
+              )
+
+              assert any(
+                  event["to_status"] == "RETRY"
+                  for event in history
+              )
+
+              print("PASS: Task lifecycle history persisted")
+
+              recovery = RecoveryController(
+                  task_manager=manager,
+                  lifecycle_manager=lifecycle,
+                  retry_controller=RetryController(manager),
+                  stale_after_seconds=900
+              )
+
+              recovery_history = (
+                  recovery.get_recovery_history(task_id)
+              )
+
+              assert len(recovery_history) >= 2
+
+              report = recovery.recovery_report()
+
+              assert report["total_recoveries"] >= 1
+              assert report["retry_scheduled"] >= 1
+
+              print("PASS: Recovery history survived another run")
+              print("Recovery report:", report)
+
+              # Remove only this validation task.
+              assert manager.delete_task(task_id)
+
+              # Remove only this validation manifest.
+              storage.delete(manifest_key)
+
+              assert manager.get_task(task_id) is None
+
+              print("PASS: Validation task cleanup")
+              print("VERIFY STAGE SUCCESS")
+
+          else:
+              raise ValueError(f"Unknown validation mode: {mode}")
+
+          PY
+
+      - name: Compile Architecture
+        run: |
+          python -m compileall -q platform_core
+          echo "Architecture compilation successful."
+
+      - name: Final Result
+        run: |
+          echo "======================================"
+          echo "PHASE 3C-6D VALIDATION"
+          echo "Mode: $VALIDATION_MODE"
+          echo "======================================"
