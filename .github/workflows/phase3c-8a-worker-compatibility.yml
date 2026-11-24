@@ -11,8 +11,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # --------------------------------------------------
+      # 1. Checkout
+      # --------------------------------------------------
+
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 2. Setup Python
+      # --------------------------------------------------
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -25,7 +33,7 @@ jobs:
           pip install pytest requests
 
       # --------------------------------------------------
-      # 1. Update BaseWorker Contract
+      # 3. Update BaseWorker Contract
       # --------------------------------------------------
 
       - name: Update BaseWorker Contract
@@ -59,7 +67,7 @@ jobs:
           PY
 
       # --------------------------------------------------
-      # 2. Update ExecutionEngine
+      # 4. Update Execution Engine
       # --------------------------------------------------
 
       - name: Update Execution Engine
@@ -292,42 +300,140 @@ jobs:
           PY
 
       # --------------------------------------------------
-      # 3. Preserve Runtime API Compatibility
+      # 5. Runtime Compatibility Patch (AST Based)
       # --------------------------------------------------
 
       - name: Update Architecture Runtime
         run: |
           python - <<'PY'
+          import ast
           from pathlib import Path
 
           path = Path("platform_core/runtime.py")
+
           source = path.read_text(encoding="utf-8")
 
-          old = "        result = self.execution_engine.execute_task(task_id)\n"
+          tree = ast.parse(source)
 
-          new = (
-              old
-              + '        if result.get("status") == "RETRY":\n'
-              + '            result = {**result, "execution_status": "RETRY", "status": "FAILED"}\n'
-          )
+          runtime_class = None
 
-          count = source.count(old)
+          for node in tree.body:
+              if isinstance(node, ast.ClassDef):
+                  if node.name == "ArchitectureRuntime":
+                      runtime_class = node
+                      break
 
-          if count != 1:
+          if runtime_class is None:
               raise RuntimeError(
-                  f"Expected exactly one Runtime execute_task call, "
-                  f"found {count}. No automatic replacement was performed."
+                  "ArchitectureRuntime class not found."
               )
 
-          source = source.replace(old, new, 1)
+          execute_method = None
 
-          path.write_text(source, encoding="utf-8")
+          for node in runtime_class.body:
+              if isinstance(node, ast.FunctionDef):
+                  if node.name == "execute_task":
+                      execute_method = node
+                      break
 
-          print("Runtime compatibility updated successfully.")
+          if execute_method is None:
+              raise RuntimeError(
+                  "ArchitectureRuntime.execute_task() not found."
+              )
+
+          target_line = None
+
+          for node in ast.walk(execute_method):
+
+              if not isinstance(node, ast.Assign):
+                  continue
+
+              is_result_assignment = any(
+                  isinstance(target, ast.Name)
+                  and target.id == "result"
+                  for target in node.targets
+              )
+
+              value = node.value
+
+              if not is_result_assignment:
+                  continue
+
+              if not isinstance(value, ast.Call):
+                  continue
+
+              if not isinstance(value.func, ast.Attribute):
+                  continue
+
+              if value.func.attr != "execute_task":
+                  continue
+
+              receiver = value.func.value
+
+              if not isinstance(receiver, ast.Attribute):
+                  continue
+
+              if receiver.attr != "execution_engine":
+                  continue
+
+              if not isinstance(receiver.value, ast.Name):
+                  continue
+
+              if receiver.value.id != "self":
+                  continue
+
+              target_line = node.end_lineno
+              break
+
+          if target_line is None:
+              raise RuntimeError(
+                  "Could not locate the Runtime execution_engine "
+                  "execute_task assignment. No changes made."
+              )
+
+          lines = source.splitlines(keepends=True)
+
+          # Check whether the patch already exists.
+          following_lines = "".join(
+              lines[target_line:target_line + 8]
+          )
+
+          if 'result.get("status") == "RETRY"' in following_lines:
+              print("Runtime compatibility patch already exists.")
+              raise SystemExit(0)
+
+          patch = [
+              '        if result.get("status") == "RETRY":\n',
+              '            result = {\n',
+              '                **result,\n',
+              '                "execution_status": "RETRY",\n',
+              '                "status": "FAILED",\n',
+              '            }\n',
+          ]
+
+          lines[target_line:target_line] = patch
+
+          updated_source = "".join(lines)
+
+          # Validate syntax before writing.
+          compile(
+              updated_source,
+              str(path),
+              "exec"
+          )
+
+          path.write_text(
+              updated_source,
+              encoding="utf-8"
+          )
+
+          print(
+              "Runtime compatibility patch applied successfully."
+          )
           PY
 
       # --------------------------------------------------
-      # 4. Add Compatibility Tests
+      # 6. Create Compatibility Tests
       # --------------------------------------------------
 
       - name: Create Compatibility Tests
@@ -531,6 +637,7 @@ jobs:
 
               assert result["status"] == "SUCCESS"
               assert "result" in result
+
               assert result["result"]["received"] == {
                   "value": 123
               }
@@ -558,53 +665,26 @@ jobs:
               received = result["result"]["received"]
 
               assert received["task_id"] == task["task_id"]
+
               assert received["payload"]["data"]["value"] == 123
           PY
 
       # --------------------------------------------------
-      # 5. Compile
+      # 7. Validate Runtime Patch
+      # --------------------------------------------------
+
+      - name: Validate Runtime Patch
+        run: |
+          python -m py_compile platform_core/runtime.py
+          python -m py_compile platform_core/execution/execution_engine.py
+          python -m py_compile platform_core/contracts/base_worker.py
+
+      # --------------------------------------------------
+      # 8. Compile Platform
       # --------------------------------------------------
 
       - name: Compile Platform
         run: |
           python -m compileall -q platform_core
 
-      # --------------------------------------------------
-      # 6. Run New Tests
-      # --------------------------------------------------
-
-      - name: Run Phase 3C-8A Tests
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          python -m pytest -v \
-            tests/test_phase3c8a_worker_compatibility.py
-
-      # --------------------------------------------------
-      # 7. Run ALL Existing Tests
-      # --------------------------------------------------
-
-      - name: Run Full Regression Test Suite
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          python -m pytest -v tests/
-
-      # --------------------------------------------------
-      # 8. Commit
-      # --------------------------------------------------
-
-      - name: Commit Changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add platform_core/contracts/base_worker.py
-          git add platform_core/execution/execution_engine.py
-          git add platform_core/runtime.py
-          git add tests/test_phase3c8a_worker_compatibility.py
-
-          git diff --cached --quiet || \
-            git commit -m "Fix Phase 3C-8A worker compatibility"
-
-          git push
+      # -------------
