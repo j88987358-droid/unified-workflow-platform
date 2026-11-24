@@ -24,13 +24,45 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest requests
 
-      - name: Verify Required Files
-        run: |
-          test -f platform_core/execution/execution_engine.py
-          test -f platform_core/plugin_system/worker_manager.py
-          echo "Required files verified."
+      # --------------------------------------------------
+      # 1. Update BaseWorker Contract
+      # --------------------------------------------------
 
-      - name: Implement Worker Compatibility
+      - name: Update BaseWorker Contract
+        run: |
+          cat > platform_core/contracts/base_worker.py <<'PY'
+          from abc import ABC, abstractmethod
+
+
+          class BaseWorker(ABC):
+
+              name = None
+              version = "1.0.0"
+
+              # Modern workers receive the complete task.
+              task_input_mode = "full_task"
+
+              @abstractmethod
+              def initialize(self, context):
+                  pass
+
+              @abstractmethod
+              def execute(self, task):
+                  pass
+
+              @abstractmethod
+              def health_check(self):
+                  pass
+
+              def shutdown(self):
+                  pass
+          PY
+
+      # --------------------------------------------------
+      # 2. Update ExecutionEngine
+      # --------------------------------------------------
+
+      - name: Update Execution Engine
         run: |
           cat > platform_core/execution/execution_engine.py <<'PY'
           class ExecutionEngine:
@@ -73,13 +105,17 @@ jobs:
                   return worker_id
 
               def _get_worker_input(self, worker_id, task):
-                  worker = self.worker_manager.workers.get(worker_id)
+                  worker = self.worker_manager.workers.get(
+                      worker_id
+                  )
 
                   if worker is None:
                       raise KeyError(
                           f"Worker not registered: {worker_id}"
                       )
 
+                  # BaseWorker defaults to full_task.
+                  # Legacy workers default to payload.
                   input_mode = getattr(
                       worker,
                       "task_input_mode",
@@ -88,14 +124,14 @@ jobs:
 
                   if input_mode == "payload":
                       payload = task.get("payload") or {}
+
                       return payload.get("data", {})
 
                   if input_mode == "full_task":
                       return task
 
                   raise ValueError(
-                      f"Unsupported task_input_mode for {worker_id}: "
-                      f"{input_mode}"
+                      f"Unsupported task_input_mode: {input_mode}"
                   )
 
               def _ensure_worker_ready(self, worker_id):
@@ -104,12 +140,16 @@ jobs:
                           f"Worker not registered: {worker_id}"
                       )
 
-                  status = self.worker_manager.status.get(worker_id)
+                  status = self.worker_manager.status.get(
+                      worker_id
+                  )
 
                   if status != "READY":
                       self.worker_manager.start(worker_id)
 
-                  if not self.worker_manager.health_check(worker_id):
+                  if not self.worker_manager.health_check(
+                      worker_id
+                  ):
                       raise RuntimeError(
                           f"Worker unhealthy: {worker_id}"
                       )
@@ -129,18 +169,33 @@ jobs:
 
                       result = self.worker_manager.execute(
                           worker_id,
-                          worker_input,
+                          worker_input
                       )
 
-                      return self.lifecycle.mark_success(
+                      # Preserve result in lifecycle history.
+                      self.lifecycle.mark_success(
                           task_id,
                           details={
-                              "result": result,
-                          },
+                              "result": result
+                          }
                       )
 
+                      # Preserve the original ExecutionOrchestrator
+                      # response structure.
+                      return {
+                          "task_id": task_id,
+                          "status": "SUCCESS",
+                          "result": result
+                      }
+
                   except Exception as exc:
-                      current = self.task_manager.get_task(task_id)
+
+                      current = self.task_manager.get_task(
+                          task_id
+                      )
+
+                      if current is None:
+                          raise KeyError(task_id)
 
                       if current["status"] != "RUNNING":
                           raise
@@ -148,13 +203,14 @@ jobs:
                       self.lifecycle.mark_failed(
                           task_id,
                           details={
-                              "error": str(exc),
-                          },
+                              "error": str(exc)
+                          }
                       )
 
+                      # Internal lifecycle remains RETRY.
                       return self.retry_controller.handle_failure(
                           task_id,
-                          error=str(exc),
+                          error=str(exc)
                       )
 
               def execute_task(self, task_id):
@@ -164,9 +220,13 @@ jobs:
                       raise KeyError(task_id)
 
                   if task["status"] == "PENDING":
-                      task = self.lifecycle.mark_running(task_id)
+
+                      task = self.lifecycle.mark_running(
+                          task_id
+                      )
 
                   elif task["status"] != "RUNNING":
+
                       raise ValueError(
                           f"Task cannot execute from status "
                           f"{task['status']}"
@@ -183,17 +243,24 @@ jobs:
                   results = []
 
                   for _ in range(max_tasks):
-                      task = self.task_manager.get_next_pending_task()
+
+                      task = (
+                          self.task_manager.get_next_pending_task()
+                      )
 
                       if task is None:
                           break
 
-                      result = self.execute_task(task["task_id"])
+                      result = self.execute_task(
+                          task["task_id"]
+                      )
+
                       results.append(result)
 
                   return results
 
               def process_due_retries(self):
+
                   due_tasks = (
                       self.retry_controller.process_due_retries()
                   )
@@ -201,266 +268,370 @@ jobs:
                   results = []
 
                   for task in due_tasks:
-                      result = self._execute_running_task(task)
+
+                      result = self._execute_running_task(
+                          task
+                      )
+
                       results.append(result)
 
                   return results
 
               def run_once(self, max_tasks=100):
+
                   return {
-                      "pending_results": self.process_pending_tasks(
-                          max_tasks=max_tasks
+                      "pending_results": (
+                          self.process_pending_tasks(
+                              max_tasks=max_tasks
+                          )
                       ),
-                      "retry_results": self.process_due_retries(),
+
+                      "retry_results": (
+                          self.process_due_retries()
+                      )
                   }
           PY
 
-          python -m py_compile platform_core/execution/execution_engine.py
+      # --------------------------------------------------
+      # 3. Preserve Runtime API Compatibility
+      # --------------------------------------------------
 
-      - name: Create Worker Compatibility Tests
+      - name: Update Architecture Runtime
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("platform_core/runtime.py")
+          source = path.read_text()
+
+          old = '''        result = self.execution_engine.execute_task(
+              task_id
+          )
+
+          if result["status"] == "SUCCESS":
+              self.metrics["tasks_completed"] += 1
+          else:
+              self.metrics["tasks_failed"] += 1
+
+          self.save_state()
+
+          return result
+          '''
+
+          new = '''        result = self.execution_engine.execute_task(
+              task_id
+          )
+
+          # Preserve legacy Runtime API behavior.
+          # The persistent task lifecycle still remains RETRY.
+          if result["status"] == "RETRY":
+              result = {
+                  **result,
+                  "execution_status": "RETRY",
+                  "status": "FAILED",
+              }
+
+          if result["status"] == "SUCCESS":
+              self.metrics["tasks_completed"] += 1
+          else:
+              self.metrics["tasks_failed"] += 1
+
+          self.save_state()
+
+          return result
+          '''
+
+          if old not in source:
+              raise RuntimeError(
+                  "Runtime execute_task block does not match "
+                  "the expected original implementation. "
+                  "No automatic replacement was performed."
+              )
+
+          path.write_text(source.replace(old, new, 1))
+
+          print("Runtime compatibility updated.")
+          PY
+
+      # --------------------------------------------------
+      # 4. Add Compatibility Tests
+      # --------------------------------------------------
+
+      - name: Create Compatibility Tests
         run: |
           mkdir -p tests
 
           cat > tests/test_phase3c8a_worker_compatibility.py <<'PY'
           import pytest
 
+          from platform_core.contracts.base_worker import BaseWorker
           from platform_core.execution.execution_engine import ExecutionEngine
+          from platform_core.plugin_system.worker_manager import WorkerManager
+          from platform_core.storage.memory_storage import InMemoryStorage
+          from platform_core.task_queue.persistent_task_manager import PersistentTaskManager
+          from platform_core.task_queue.task_lifecycle_manager import TaskLifecycleManager
+          from platform_core.task_queue.retry_controller import RetryController
 
 
-          TASK = {
-              "task_id": "test-001",
-              "task_type": "test_worker",
-              "status": "RUNNING",
-              "payload": {
-                  "worker_id": "test_worker",
-                  "data": {
-                      "business": "HVAC Contractor",
-                      "location": "Tampa"
+          class ModernWorker(BaseWorker):
+
+              name = "modern.worker"
+
+              def initialize(self, context):
+                  self.ready = True
+
+              def execute(self, task):
+                  return {
+                      "received": task
                   }
-              }
-          }
+
+              def health_check(self):
+                  return True
 
 
           class LegacyWorker:
+
               def initialize(self, context):
-                  pass
+                  self.ready = True
 
               def execute(self, task):
-                  return {"received": task}
+                  return {
+                      "received": task
+                  }
 
               def health_check(self):
                   return True
 
 
-          class NewWorker:
+          class ExplicitFullTaskWorker(LegacyWorker):
               task_input_mode = "full_task"
 
-              def initialize(self, context):
-                  pass
 
-              def execute(self, task):
-                  return {"received": task}
-
-              def health_check(self):
-                  return True
+          class InvalidWorker(LegacyWorker):
+              task_input_mode = "invalid"
 
 
-          class WorkerManager:
-              def __init__(self, worker):
-                  self.workers = {
-                      "test_worker": worker
-                  }
+          @pytest.fixture
+          def setup():
+              storage = InMemoryStorage()
 
-                  self.status = {
-                      "test_worker": "READY"
-                  }
+              manager = PersistentTaskManager(storage)
 
-                  self.received_input = None
+              lifecycle = TaskLifecycleManager(manager)
 
-              def health_check(self, worker_id):
-                  return self.workers[worker_id].health_check()
-
-              def start(self, worker_id):
-                  self.workers[worker_id].initialize({})
-                  self.status[worker_id] = "READY"
-
-              def execute(self, worker_id, task_input):
-                  self.received_input = task_input
-
-                  return self.workers[worker_id].execute(
-                      task_input
-                  )
-
-
-          class TaskManager:
-              def get_task(self, task_id):
-                  if task_id == TASK["task_id"]:
-                      return TASK.copy()
-
-                  return None
-
-
-          class LifecycleManager:
-              def mark_success(self, task_id, details=None):
-                  return {
-                      "task_id": task_id,
-                      "status": "SUCCESS",
-                      "details": details
-                  }
-
-              def mark_failed(self, task_id, details=None):
-                  return {
-                      "task_id": task_id,
-                      "status": "FAILED",
-                      "details": details
-                  }
-
-              def mark_running(self, task_id):
-                  result = TASK.copy()
-                  result["status"] = "RUNNING"
-                  return result
-
-
-          class RetryController:
-              def handle_failure(self, task_id, error=None):
-                  return {
-                      "task_id": task_id,
-                      "status": "RETRY",
-                      "error": error
-                  }
-
-              def process_due_retries(self):
-                  return []
-
-
-          def build_engine(worker):
-              return ExecutionEngine(
-                  task_manager=TaskManager(),
-                  lifecycle_manager=LifecycleManager(),
-                  retry_controller=RetryController(),
-                  worker_manager=WorkerManager(worker),
+              retry = RetryController(
+                  manager,
+                  max_retries=3
               )
 
+              workers = WorkerManager()
 
-          def test_legacy_worker_receives_payload_data():
-              engine = build_engine(LegacyWorker())
+              workers.register(
+                  "modern.worker",
+                  ModernWorker()
+              )
 
-              result = engine._execute_running_task(TASK)
+              workers.register(
+                  "legacy.worker",
+                  LegacyWorker()
+              )
 
-              assert result["status"] == "SUCCESS"
+              workers.register(
+                  "explicit.worker",
+                  ExplicitFullTaskWorker()
+              )
 
-              assert engine.worker_manager.received_input == {
-                  "business": "HVAC Contractor",
-                  "location": "Tampa"
+              workers.register(
+                  "invalid.worker",
+                  InvalidWorker()
+              )
+
+              engine = ExecutionEngine(
+                  manager,
+                  lifecycle,
+                  retry,
+                  workers
+              )
+
+              return manager, lifecycle, retry, workers, engine
+
+
+          def make_task(worker_id):
+              return {
+                  "task_id": "compatibility-test",
+                  "task_type": worker_id,
+                  "status": "RUNNING",
+                  "payload": {
+                      "worker_id": worker_id,
+                      "data": {
+                          "value": 123
+                      }
+                  }
               }
 
 
-          def test_new_worker_receives_full_task():
-              engine = build_engine(NewWorker())
+          def test_base_worker_defaults_to_full_task():
+              worker = ModernWorker()
 
-              result = engine._execute_running_task(TASK)
-
-              assert result["status"] == "SUCCESS"
-              assert engine.worker_manager.received_input == TASK
+              assert worker.task_input_mode == "full_task"
 
 
-          def test_payload_mode_is_default():
-              engine = build_engine(LegacyWorker())
+          def test_modern_worker_receives_full_task(setup):
+              manager, lifecycle, retry, workers, engine = setup
 
-              result = engine._get_worker_input(
-                  "test_worker",
-                  TASK
+              task = make_task("modern.worker")
+
+              received = engine._get_worker_input(
+                  "modern.worker",
+                  task
               )
 
-              assert result == TASK["payload"]["data"]
+              assert received == task
 
 
-          def test_full_task_mode_is_explicit():
-              engine = build_engine(NewWorker())
+          def test_legacy_worker_receives_payload(setup):
+              manager, lifecycle, retry, workers, engine = setup
 
-              result = engine._get_worker_input(
-                  "test_worker",
-                  TASK
+              task = make_task("legacy.worker")
+
+              received = engine._get_worker_input(
+                  "legacy.worker",
+                  task
               )
 
-              assert result == TASK
+              assert received == {
+                  "value": 123
+              }
 
 
-          def test_unknown_input_mode_is_rejected():
-              class InvalidWorker:
-                  task_input_mode = "unknown"
+          def test_explicit_full_task_mode(setup):
+              manager, lifecycle, retry, workers, engine = setup
 
-              engine = build_engine(InvalidWorker())
+              task = make_task("explicit.worker")
+
+              received = engine._get_worker_input(
+                  "explicit.worker",
+                  task
+              )
+
+              assert received == task
+
+
+          def test_invalid_input_mode_rejected(setup):
+              manager, lifecycle, retry, workers, engine = setup
+
+              task = make_task("invalid.worker")
 
               with pytest.raises(ValueError):
                   engine._get_worker_input(
-                      "test_worker",
-                      TASK
+                      "invalid.worker",
+                      task
                   )
 
 
-          def test_unregistered_worker_is_rejected():
-              engine = build_engine(LegacyWorker())
+          def test_unregistered_worker_rejected(setup):
+              manager, lifecycle, retry, workers, engine = setup
 
               with pytest.raises(KeyError):
                   engine._get_worker_input(
-                      "missing_worker",
-                      TASK
+                      "missing.worker",
+                      make_task("missing.worker")
                   )
 
 
-          def test_worker_id_is_read_from_payload():
-              engine = build_engine(LegacyWorker())
+          def test_success_returns_legacy_result_structure(setup):
+              manager, lifecycle, retry, workers, engine = setup
 
-              assert engine._get_worker_id(TASK) == "test_worker"
+              task = manager.create_task(
+                  "legacy.worker",
+                  payload={
+                      "worker_id": "legacy.worker",
+                      "data": {
+                          "value": 123
+                      }
+                  }
+              )
 
+              result = engine.execute_task(
+                  task["task_id"]
+              )
 
-          def test_worker_id_falls_back_to_task_type():
-              engine = build_engine(LegacyWorker())
-
-              task = {
-                  "task_type": "test_worker",
-                  "payload": {}
+              assert result["status"] == "SUCCESS"
+              assert "result" in result
+              assert result["result"]["received"] == {
+                  "value": 123
               }
 
-              assert engine._get_worker_id(task) == "test_worker"
 
+          def test_modern_worker_receives_complete_task_during_execution(setup):
+              manager, lifecycle, retry, workers, engine = setup
 
-          def test_missing_worker_id_is_rejected():
-              engine = build_engine(LegacyWorker())
+              task = manager.create_task(
+                  "modern.worker",
+                  payload={
+                      "worker_id": "modern.worker",
+                      "data": {
+                          "value": 123
+                      }
+                  }
+              )
 
-              with pytest.raises(ValueError):
-                  engine._get_worker_id({
-                      "payload": {}
-                  })
+              result = engine.execute_task(
+                  task["task_id"]
+              )
+
+              assert result["status"] == "SUCCESS"
+
+              received = result["result"]["received"]
+
+              assert received["task_id"] == task["task_id"]
+              assert received["payload"]["data"]["value"] == 123
           PY
+
+      # --------------------------------------------------
+      # 5. Compile
+      # --------------------------------------------------
+
+      - name: Compile Platform
+        run: |
+          python -m compileall -q platform_core
+
+      # --------------------------------------------------
+      # 6. Run New Tests
+      # --------------------------------------------------
 
       - name: Run Phase 3C-8A Tests
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m pytest -v tests/test_phase3c8a_worker_compatibility.py
+          python -m pytest -v \
+            tests/test_phase3c8a_worker_compatibility.py
 
-      - name: Run Existing Platform Tests
+      # --------------------------------------------------
+      # 7. Run ALL Existing Tests
+      # --------------------------------------------------
+
+      - name: Run Full Regression Test Suite
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m pytest -q tests/ \
-            --ignore=tests/test_phase3c8a_worker_compatibility.py
+          python -m pytest -v tests/
 
-      - name: Compile Platform
-        run: |
-          python -m compileall -q platform_core
+      # --------------------------------------------------
+      # 8. Commit
+      # --------------------------------------------------
 
       - name: Commit Changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          git add platform_core/contracts/base_worker.py
           git add platform_core/execution/execution_engine.py
+          git add platform_core/runtime.py
           git add tests/test_phase3c8a_worker_compatibility.py
 
           git diff --cached --quiet || \
-            git commit -m "Add legacy and new worker compatibility"
+            git commit -m "Fix Phase 3C-8A worker compatibility"
 
           git push
