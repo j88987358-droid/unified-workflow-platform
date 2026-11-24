@@ -6,6 +6,12 @@ from platform_core.monitoring.health_monitor import HealthMonitor
 from platform_core.monitoring.system_reporter import SystemReporter
 from platform_core.orchestrator import ExecutionOrchestrator
 
+from platform_core.task_queue.task_lifecycle_manager import TaskLifecycleManager
+from platform_core.task_queue.retry_controller import RetryController
+from platform_core.task_queue.recovery_controller import RecoveryController
+from platform_core.execution.execution_engine import ExecutionEngine
+
+
 class WorkerHealthProbe:
 
     def __init__(self, worker_manager, worker_id):
@@ -20,6 +26,7 @@ class WorkerHealthProbe:
         except Exception:
             return False
 
+
 class ArchitectureRuntime:
 
     def __init__(self, storage=None):
@@ -30,7 +37,9 @@ class ArchitectureRuntime:
         if self.initialized:
             return self.components
 
-        self.components = ArchitectureInitializer().initialize()
+        self.components = ArchitectureInitializer().initialize(
+            task_storage=self.storage
+        )
 
         self.worker_registry = self.components[
             "worker_registry"
@@ -60,6 +69,27 @@ class ArchitectureRuntime:
         self.health_monitor = HealthMonitor()
         self.reporter = SystemReporter()
 
+        self.lifecycle_manager = TaskLifecycleManager(
+            self.task_manager
+        )
+
+        self.retry_controller = RetryController(
+            self.task_manager
+        )
+
+        self.recovery_controller = RecoveryController(
+            task_manager=self.task_manager,
+            lifecycle_manager=self.lifecycle_manager,
+            retry_controller=self.retry_controller,
+        )
+
+        self.execution_engine = ExecutionEngine(
+            task_manager=self.task_manager,
+            lifecycle_manager=self.lifecycle_manager,
+            retry_controller=self.retry_controller,
+            worker_manager=self.worker_manager,
+        )
+
         self.orchestrator = ExecutionOrchestrator(
             self.worker_manager,
             self.task_manager,
@@ -73,10 +103,14 @@ class ArchitectureRuntime:
         self.metrics = (
             self.previous_state.get("metrics", {})
             if self.previous_state
-            else {"tasks_completed": 0, "tasks_failed": 0}
+            else {
+                "tasks_completed": 0,
+                "tasks_failed": 0
+            }
         )
 
         self.initialized = True
+
         return self.components
 
     def register_worker(self, worker_id, worker, context=None):
@@ -87,11 +121,13 @@ class ArchitectureRuntime:
         )
 
         probe = WorkerHealthProbe(
-            self.worker_manager, worker_id
+            self.worker_manager,
+            worker_id
         )
 
         self.health_monitor.register(
-            f"worker:{worker_id}", probe
+            f"worker:{worker_id}",
+            probe
         )
 
         return result
@@ -100,13 +136,17 @@ class ArchitectureRuntime:
         self._require_initialized()
 
         return self.orchestrator.create_task(
-            worker_id, payload, priority
+            worker_id,
+            payload,
+            priority
         )
 
     def execute_task(self, task_id):
         self._require_initialized()
 
-        result = self.orchestrator.execute_task(task_id)
+        result = self.execution_engine.execute_task(
+            task_id
+        )
 
         if result["status"] == "SUCCESS":
             self.metrics["tasks_completed"] += 1
@@ -114,7 +154,24 @@ class ArchitectureRuntime:
             self.metrics["tasks_failed"] += 1
 
         self.save_state()
+
         return result
+
+    def run_once(self, max_tasks=100):
+        self._require_initialized()
+
+        recovery_results = (
+            self.recovery_controller.recover_stale_tasks()
+        )
+
+        execution_results = self.execution_engine.run_once(
+            max_tasks=max_tasks
+        )
+
+        return {
+            "recovery_results": recovery_results,
+            "execution_results": execution_results,
+        }
 
     def save_state(self):
         self._require_initialized()
@@ -127,7 +184,8 @@ class ArchitectureRuntime:
         }
 
         return self.checkpoints.save(
-            "runtime", state
+            "runtime",
+            state
         )
 
     def health_report(self):
