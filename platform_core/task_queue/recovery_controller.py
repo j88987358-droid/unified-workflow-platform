@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 
 class RecoveryController:
@@ -62,7 +62,9 @@ class RecoveryController:
             return None
 
         try:
-            parsed = datetime.fromisoformat(value)
+            parsed = datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
 
             if parsed.tzinfo is None:
                 parsed = parsed.replace(
@@ -73,8 +75,28 @@ class RecoveryController:
                 timezone.utc
             )
 
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, AttributeError):
             return None
+
+    def has_active_lease(self, task):
+        """
+        Protect tasks with an unexpired execution lease.
+
+        If an ACTIVE lease has an invalid or missing expiry,
+        fail safely and do not recover the task.
+        """
+
+        if task.get("lease_status") != "ACTIVE":
+            return False
+
+        lease_expires_at = self._parse_datetime(
+            task.get("lease_expires_at")
+        )
+
+        if lease_expires_at is None:
+            return True
+
+        return lease_expires_at > self._now()
 
     def _record_event(
         self,
@@ -125,6 +147,10 @@ class RecoveryController:
         if task.get("status") != "RUNNING":
             return False
 
+        # Never recover a task with an active lease.
+        if self.has_active_lease(task):
+            return False
+
         started_at = self._parse_datetime(
             task.get("started_at")
             or task.get("updated_at")
@@ -165,6 +191,10 @@ class RecoveryController:
         if task.get("status") != "RUNNING":
             return None
 
+        # Recheck lease immediately before recovery.
+        if self.has_active_lease(task):
+            return None
+
         if not self.is_stale(task):
             return None
 
@@ -173,7 +203,7 @@ class RecoveryController:
             "RECOVERY_STARTED",
             {
                 "previous_status": "RUNNING",
-                "reason": "Stale running task detected",
+                "reason": "Stale execution without active lease",
             },
         )
 
@@ -236,7 +266,7 @@ class RecoveryController:
         dead_letter_count = sum(
             1 for event in completed
             if event["details"].get("new_status")
-          == "DEAD_LETTER"
+            == "DEAD_LETTER"
         )
 
         return {
