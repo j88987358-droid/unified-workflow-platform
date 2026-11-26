@@ -61,10 +61,10 @@ class ExecutionEngine:
 
     def _cleanup_lease(self, lease_manager, lease_lost):
         """
-        Stop heartbeat before releasing the lease.
+        Safely stop heartbeat and release execution lease.
 
-        Cleanup errors must not overwrite the task execution
-        result or the original execution exception.
+        Cleanup errors must not overwrite the original
+        task execution result.
         """
 
         if lease_manager is None:
@@ -74,8 +74,8 @@ class ExecutionEngine:
             lease_manager.stop()
 
         except Exception:
-            # Heartbeat state is uncertain.
-            # Do not release a lease whose ownership is uncertain.
+            # Heartbeat may still be running or ownership
+            # may be uncertain. Do not release the lease.
             return
 
         if lease_lost:
@@ -85,8 +85,8 @@ class ExecutionEngine:
             lease_manager.release()
 
         except Exception:
-            # The lease will expire naturally if release fails.
-            # Preserve the original task execution result.
+            # Lease will expire naturally if release fails.
+            # Preserve the original execution result.
             pass
 
     def _execute_running_task(self, task):
@@ -95,11 +95,12 @@ class ExecutionEngine:
         lease_manager = None
         lease_lost = False
 
+        # Acquire execution lease before worker execution.
         if self.lease_manager_factory is not None:
             lease_manager = self.lease_manager_factory()
 
-            # If acquisition fails, leave the task RUNNING.
-            # Recovery can handle it after the lease expires.
+            # If acquisition fails, task remains RUNNING.
+            # RecoveryController can recover it later.
             lease_manager.start(task_id)
 
         try:
@@ -113,9 +114,14 @@ class ExecutionEngine:
                     task,
                 )
 
-                # Verify ownership before accepting success.
+                # Verify lease before accepting success.
                 if lease_manager is not None:
-                    lease_manager.check()
+                    try:
+                        lease_manager.check()
+
+                    except Exception:
+                        lease_lost = True
+                        raise
 
                 return self.lifecycle.mark_success(
                     task_id,
@@ -126,8 +132,12 @@ class ExecutionEngine:
 
             except Exception as exc:
 
-                # Do not retry if lease ownership is uncertain.
+                # Do not retry when lease ownership is lost.
                 if lease_manager is not None:
+
+                    if lease_lost:
+                        raise
+
                     try:
                         lease_manager.check()
 
@@ -142,6 +152,7 @@ class ExecutionEngine:
                 if current is None:
                     raise KeyError(task_id)
 
+                # Do not modify a task that is no longer RUNNING.
                 if current["status"] != "RUNNING":
                     raise
 
