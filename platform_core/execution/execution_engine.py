@@ -6,6 +6,7 @@ class ExecutionEngine:
         lifecycle_manager,
         retry_controller,
         worker_manager,
+        lease_manager_factory=None,
     ):
         if task_manager is None:
             raise ValueError("TaskManager required")
@@ -23,6 +24,8 @@ class ExecutionEngine:
         self.lifecycle = lifecycle_manager
         self.retry_controller = retry_controller
         self.worker_manager = worker_manager
+
+        self.lease_manager_factory = lease_manager_factory
 
     def _get_worker_id(self, task):
         payload = task.get("payload") or {}
@@ -60,42 +63,80 @@ class ExecutionEngine:
     def _execute_running_task(self, task):
         task_id = task["task_id"]
 
+        lease_manager = None
+        lease_lost = False
+
+        # Acquire execution lease.
+        if self.lease_manager_factory is not None:
+            lease_manager = self.lease_manager_factory()
+
+            lease_manager.start(task_id)
+
         try:
-            worker_id = self._get_worker_id(task)
+            try:
+                worker_id = self._get_worker_id(task)
 
-            self._ensure_worker_ready(worker_id)
+                self._ensure_worker_ready(worker_id)
 
-            result = self.worker_manager.execute(
-                worker_id,
-                task,
-            )
+                result = self.worker_manager.execute(
+                    worker_id,
+                    task,
+                )
 
-            return self.lifecycle.mark_success(
-                task_id,
-                details={
-                    "result": result,
-                },
-            )
+                # Verify lease before accepting success.
+                if lease_manager is not None:
+                    lease_manager.check()
 
-        except Exception as exc:
-            current = self.task_manager.get_task(
-                task_id
-            )
+                return self.lifecycle.mark_success(
+                    task_id,
+                    details={
+                        "result": result,
+                    },
+                )
 
-            if current["status"] != "RUNNING":
-                raise
+            except Exception as exc:
 
-            self.lifecycle.mark_failed(
-                task_id,
-                details={
-                    "error": str(exc),
-                },
-            )
+                # Do not retry if lease ownership is uncertain.
+                if lease_manager is not None:
+                    try:
+                        lease_manager.check()
+                    except Exception:
+                        lease_lost = True
+                        raise
 
-            return self.retry_controller.handle_failure(
-                task_id,
-                error=str(exc),
-            )
+                current = self.task_manager.get_task(
+                    task_id
+                )
+
+                if current is None:
+                    raise KeyError(task_id)
+
+                if current["status"] != "RUNNING":
+                    raise
+
+                self.lifecycle.mark_failed(
+                    task_id,
+                    details={
+                        "error": str(exc),
+                    },
+                )
+
+                return self.retry_controller.handle_failure(
+                    task_id,
+                    error=str(exc),
+                )
+
+        finally:
+            if lease_manager is not None:
+
+                if lease_lost:
+                    try:
+                        lease_manager.stop()
+                    except Exception:
+                        pass
+
+                else:
+                    lease_manager.release()
 
     def execute_task(self, task_id):
         task = self.task_manager.get_task(task_id)
@@ -157,4 +198,4 @@ class ExecutionEngine:
                 max_tasks=max_tasks
             ),
             "retry_results": self.process_due_retries(),
-        }
+    }
