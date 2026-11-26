@@ -1,0 +1,49 @@
+name: Phase 3C-8C Live Storage API Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-storage-validation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Validate Live Google Apps Script API
+        env:
+          GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+          GOOGLE_APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from platform_core.storage.apps_script_storage import AppsScriptStorage
+
+          url = os.environ.get("GOOGLE_APPS_SCRIPT_URL")
+          token = os.environ.get("GOOGLE_APPS_SCRIPT_TOKEN")
+
+          if not url or not token:
+              raise RuntimeError("Required GitHub Secrets are missing")
+
+          storage = AppsScriptStorage(url, token)
+
+          if not storage.health_check():
+              raise RuntimeError("Live storage health check failed")
+
+          print("LIVE STORAGE API: CONNECTED")
+          print("TOKEN VALIDATION: SUCCESSFUL")
+          PY
