@@ -1,3 +1,6 @@
+import os
+import uuid
+
 from platform_core.architecture_initializer import ArchitectureInitializer
 from platform_core.storage.memory_storage import InMemoryStorage
 from platform_core.persistence.checkpoint_manager import CheckpointManager
@@ -9,7 +12,9 @@ from platform_core.orchestrator import ExecutionOrchestrator
 from platform_core.task_queue.task_lifecycle_manager import TaskLifecycleManager
 from platform_core.task_queue.retry_controller import RetryController
 from platform_core.task_queue.recovery_controller import RecoveryController
+
 from platform_core.execution.execution_engine import ExecutionEngine
+from platform_core.execution.lease_manager import ExecutionLeaseManager
 
 
 class WorkerHealthProbe:
@@ -32,6 +37,30 @@ class ArchitectureRuntime:
     def __init__(self, storage=None):
         self.storage = storage or InMemoryStorage()
         self.initialized = False
+
+    def _create_lease_manager(self):
+        run_id = os.environ.get(
+            "GITHUB_RUN_ID",
+            "local",
+        )
+
+        run_attempt = os.environ.get(
+            "GITHUB_RUN_ATTEMPT",
+            "1",
+        )
+
+        owner = (
+            f"runner-{run_id}-"
+            f"attempt-{run_attempt}-"
+            f"{uuid.uuid4().hex}"
+        )
+
+        return ExecutionLeaseManager(
+            storage=self.storage,
+            lease_seconds=180,
+            heartbeat_interval=60,
+            owner=owner,
+        )
 
     def initialize(self):
         if self.initialized:
@@ -88,6 +117,7 @@ class ArchitectureRuntime:
             lifecycle_manager=self.lifecycle_manager,
             retry_controller=self.retry_controller,
             worker_manager=self.worker_manager,
+            lease_manager_factory=self._create_lease_manager,
         )
 
         self.orchestrator = ExecutionOrchestrator(
@@ -117,7 +147,9 @@ class ArchitectureRuntime:
         self._require_initialized()
 
         result = self.orchestrator.register_worker(
-            worker_id, worker, context
+            worker_id,
+            worker,
+            context
         )
 
         probe = WorkerHealthProbe(
