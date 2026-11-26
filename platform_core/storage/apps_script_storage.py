@@ -2,6 +2,7 @@ import requests
 
 
 class AppsScriptStorage:
+
     def __init__(self, url, token, timeout=45, session=None):
         if not url or not token:
             raise ValueError("URL and token are required")
@@ -14,7 +15,7 @@ class AppsScriptStorage:
         self.timeout = timeout
         self.session = session or requests.Session()
 
-    def _request(self, action, key=None, value=None):
+    def _request(self, action, key=None, value=None, **extra):
         payload = {
             "token": self.token,
             "action": action
@@ -25,6 +26,8 @@ class AppsScriptStorage:
 
         if value is not None:
             payload["value"] = value
+
+        payload.update(extra)
 
         try:
             response = self.session.post(
@@ -59,6 +62,8 @@ class AppsScriptStorage:
 
         return result
 
+    # Existing storage operations
+
     def get(self, key):
         result = self._request("get", key=key)
 
@@ -75,11 +80,42 @@ class AppsScriptStorage:
         )
 
     def delete(self, key):
-        return self._request(
-            "delete",
-            key=key
-        )
+        return self._request("delete", key=key)
 
     def health_check(self):
         result = self._request("ping")
         return result.get("status") == "CONNECTED"
+
+    # Execution Lease operations
+
+    def lease_start(self, task_id, owner, lease_seconds=180):
+        return self._request(
+            "lease_start",
+            task_id=task_id,
+            owner=owner,
+            lease_seconds=lease_seconds
+        )
+
+    def lease_heartbeat(self, task_id, owner, lease_seconds=180):
+        return self._request(
+            "lease_heartbeat",
+            task_id=task_id,
+            owner=owner,
+            lease_seconds=lease_seconds
+        )
+
+    def lease_check(self, task_id, owner, lease_seconds=180):
+        return self._request(
+            "lease_check",
+            task_id=task_id,
+            owner=owner,
+            lease_seconds=lease_seconds
+        )
+
+    def lease_release(self, task_id, owner, lease_seconds=180):
+        return self._request(
+            "lease_release",
+            task_id=task_id,
+            owner=owner,
+            lease_seconds=lease_seconds
+            )
