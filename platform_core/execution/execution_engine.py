@@ -24,7 +24,6 @@ class ExecutionEngine:
         self.lifecycle = lifecycle_manager
         self.retry_controller = retry_controller
         self.worker_manager = worker_manager
-
         self.lease_manager_factory = lease_manager_factory
 
     def _get_worker_id(self, task):
@@ -60,16 +59,47 @@ class ExecutionEngine:
                 f"Worker unhealthy: {worker_id}"
             )
 
+    def _cleanup_lease(self, lease_manager, lease_lost):
+        """
+        Stop heartbeat before releasing the lease.
+
+        Cleanup errors must not overwrite the task execution
+        result or the original execution exception.
+        """
+
+        if lease_manager is None:
+            return
+
+        try:
+            lease_manager.stop()
+
+        except Exception:
+            # Heartbeat state is uncertain.
+            # Do not release a lease whose ownership is uncertain.
+            return
+
+        if lease_lost:
+            return
+
+        try:
+            lease_manager.release()
+
+        except Exception:
+            # The lease will expire naturally if release fails.
+            # Preserve the original task execution result.
+            pass
+
     def _execute_running_task(self, task):
         task_id = task["task_id"]
 
         lease_manager = None
         lease_lost = False
 
-        # Acquire execution lease.
         if self.lease_manager_factory is not None:
             lease_manager = self.lease_manager_factory()
 
+            # If acquisition fails, leave the task RUNNING.
+            # Recovery can handle it after the lease expires.
             lease_manager.start(task_id)
 
         try:
@@ -83,7 +113,7 @@ class ExecutionEngine:
                     task,
                 )
 
-                # Verify lease before accepting success.
+                # Verify ownership before accepting success.
                 if lease_manager is not None:
                     lease_manager.check()
 
@@ -100,6 +130,7 @@ class ExecutionEngine:
                 if lease_manager is not None:
                     try:
                         lease_manager.check()
+
                     except Exception:
                         lease_lost = True
                         raise
@@ -127,16 +158,10 @@ class ExecutionEngine:
                 )
 
         finally:
-            if lease_manager is not None:
-
-                if lease_lost:
-                    try:
-                        lease_manager.stop()
-                    except Exception:
-                        pass
-
-                else:
-                    lease_manager.release()
+            self._cleanup_lease(
+                lease_manager,
+                lease_lost,
+            )
 
     def execute_task(self, task_id):
         task = self.task_manager.get_task(task_id)
@@ -198,4 +223,4 @@ class ExecutionEngine:
                 max_tasks=max_tasks
             ),
             "retry_results": self.process_due_retries(),
-    }
+            }
