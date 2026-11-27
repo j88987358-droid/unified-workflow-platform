@@ -40,25 +40,16 @@ class ExecutionEngine:
         return worker_id
 
     def _ensure_worker_ready(self, worker_id):
-
         if worker_id not in self.worker_manager.workers:
-            raise KeyError(
-                f"Worker not registered: {worker_id}"
-            )
+            raise KeyError(f"Worker not registered: {worker_id}")
 
-        status = self.worker_manager.status.get(
-            worker_id
-        )
+        status = self.worker_manager.status.get(worker_id)
 
         if status != "READY":
             self.worker_manager.start(worker_id)
 
-        if not self.worker_manager.health_check(
-            worker_id
-        ):
-            raise RuntimeError(
-                f"Worker unhealthy: {worker_id}"
-            )
+        if not self.worker_manager.health_check(worker_id):
+            raise RuntimeError(f"Worker unhealthy: {worker_id}")
 
     def _cleanup_lease(
         self,
@@ -66,22 +57,12 @@ class ExecutionEngine:
         lease_started,
         lease_lost,
     ):
-        """
-        Safely stop heartbeat and release the lease.
-
-        Cleanup errors must not overwrite the original
-        task execution result.
-        """
-
         if lease_manager is None or not lease_started:
             return
 
         try:
             lease_manager.stop()
-
         except Exception:
-            # Heartbeat state is uncertain.
-            # Do not release the lease.
             return
 
         if lease_lost:
@@ -89,13 +70,10 @@ class ExecutionEngine:
 
         try:
             lease_manager.release()
-
         except Exception:
-            # Lease will expire naturally if release fails.
             pass
 
     def _execute_running_task(self, task):
-
         task_id = task["task_id"]
 
         lease_manager = None
@@ -103,20 +81,12 @@ class ExecutionEngine:
         lease_lost = False
 
         try:
-
-            # Create and acquire execution lease.
             if self.lease_manager_factory is not None:
-
-                lease_manager = (
-                    self.lease_manager_factory()
-                )
-
-                # Mark acquired only after successful start.
+                lease_manager = self.lease_manager_factory()
                 lease_manager.start(task_id)
                 lease_started = True
 
             try:
-
                 worker_id = self._get_worker_id(task)
 
                 self._ensure_worker_ready(worker_id)
@@ -126,54 +96,41 @@ class ExecutionEngine:
                     task,
                 )
 
-                # Verify lease ownership before success.
                 if lease_manager is not None:
-
                     try:
                         lease_manager.check()
-
                     except Exception:
                         lease_lost = True
                         raise
 
                 return self.lifecycle.mark_success(
                     task_id,
-                    details={
-                        "result": result,
-                    },
+                    details={"result": result},
                 )
 
             except Exception as exc:
 
-                # Never retry after losing lease ownership.
                 if lease_manager is not None:
-
                     if lease_lost:
                         raise
 
                     try:
                         lease_manager.check()
-
                     except Exception:
                         lease_lost = True
                         raise
 
-                current = self.task_manager.get_task(
-                    task_id
-                )
+                current = self.task_manager.get_task(task_id)
 
                 if current is None:
                     raise KeyError(task_id)
 
-                # Do not modify a task that is no longer RUNNING.
                 if current["status"] != "RUNNING":
                     raise
 
                 self.lifecycle.mark_failed(
                     task_id,
-                    details={
-                        "error": str(exc),
-                    },
+                    details={"error": str(exc)},
                 )
 
                 return self.retry_controller.handle_failure(
@@ -182,7 +139,6 @@ class ExecutionEngine:
                 )
 
         finally:
-
             self._cleanup_lease(
                 lease_manager,
                 lease_started,
@@ -190,71 +146,51 @@ class ExecutionEngine:
             )
 
     def execute_task(self, task_id):
-
         task = self.task_manager.get_task(task_id)
 
         if task is None:
             raise KeyError(task_id)
 
         if task["status"] == "PENDING":
-
-            task = self.lifecycle.mark_running(
-                task_id
-            )
+            task = self.lifecycle.mark_running(task_id)
 
         elif task["status"] != "RUNNING":
-
             raise ValueError(
-                f"Task cannot execute from status "
-                f"{task['status']}"
+                f"Task cannot execute from status {task['status']}"
             )
 
         return self._execute_running_task(task)
 
     def process_pending_tasks(self, max_tasks=100):
-
         if max_tasks < 1:
-            raise ValueError(
-                "max_tasks must be positive"
-            )
+            raise ValueError("max_tasks must be positive")
 
         results = []
 
         for _ in range(max_tasks):
-
-            task = (
-                self.task_manager.get_next_pending_task()
-            )
+            task = self.task_manager.get_next_pending_task()
 
             if task is None:
                 break
 
-            result = self.execute_task(
-                task["task_id"]
-            )
+            result = self.execute_task(task["task_id"])
 
             results.append(result)
 
         return results
 
     def process_due_retries(self):
-
-        due_tasks = (
-            self.retry_controller.process_due_retries()
-        )
+        due_tasks = self.retry_controller.process_due_retries()
 
         results = []
 
         for task in due_tasks:
-
             result = self._execute_running_task(task)
-
             results.append(result)
 
         return results
 
     def run_once(self, max_tasks=100):
-
         return {
             "pending_results": self.process_pending_tasks(
                 max_tasks=max_tasks
