@@ -15,10 +15,14 @@ class ExecutionLeaseManager:
             raise ValueError("Storage is required")
 
         if lease_seconds < 30:
-            raise ValueError("Lease duration must be at least 30 seconds")
+            raise ValueError(
+                "Lease duration must be at least 30 seconds"
+            )
 
         if heartbeat_interval <= 0:
-            raise ValueError("Heartbeat interval must be positive")
+            raise ValueError(
+                "Heartbeat interval must be positive"
+            )
 
         if heartbeat_interval >= lease_seconds:
             raise ValueError(
@@ -35,10 +39,13 @@ class ExecutionLeaseManager:
         self._thread = None
         self._error = None
         self._started = False
+        self._task_id = None
 
     def start(self, task_id):
         if self._started:
-            raise RuntimeError("Lease manager is already running")
+            raise RuntimeError(
+                "Lease manager is already running"
+            )
 
         result = self.storage.lease_start(
             task_id=task_id,
@@ -56,8 +63,24 @@ class ExecutionLeaseManager:
             daemon=True,
         )
 
-        self._started = True
-        self._thread.start()
+        try:
+            self._thread.start()
+            self._started = True
+
+        except Exception:
+            self._thread = None
+            self._started = False
+
+            try:
+                self.storage.lease_release(
+                    task_id=task_id,
+                    owner=self.owner,
+                    lease_seconds=self.lease_seconds,
+                )
+            except Exception:
+                pass
+
+            raise
 
         return result
 
@@ -105,7 +128,9 @@ class ExecutionLeaseManager:
 
     def check(self):
         if not self._started:
-            raise RuntimeError("Lease manager is not running")
+            raise RuntimeError(
+                "Lease manager is not running"
+            )
 
         if self._error is not None:
             raise RuntimeError(
@@ -119,7 +144,9 @@ class ExecutionLeaseManager:
         )
 
         if not result.get("valid"):
-            raise RuntimeError("Execution lease is no longer valid")
+            raise RuntimeError(
+                "Execution lease is no longer valid"
+            )
 
         return True
 
