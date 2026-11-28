@@ -16,7 +16,7 @@ def storage():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("init", "worker", "verify"))
+    parser.add_argument("mode", choices=("init", "worker", "verify", "cleanup"))
     parser.add_argument("key")
     args = parser.parse_args()
     adapter = storage()
@@ -38,8 +38,11 @@ def main():
         expected = 2 * INCREMENTS_PER_RUNNER
         if actual != expected:
             raise SystemExit(f"CAS concurrency check failed: expected {expected}, got {actual}")
+        print(f"PASS: two independent GitHub runners preserved all {expected} increments.")
+
+    elif args.mode == "cleanup":
         adapter.delete(args.key)
-        print(f"PASS: two independent GitHub runners preserved all {expected} increments; test key deleted.")
+        print("Live-CAS test key cleanup requested.")
 
 
 if __name__ == "__main__":
