@@ -33,6 +33,8 @@ function dispatch_(ss, body) {
   var action = String(body.action || '');
   if (action === 'ping') return { success: true, status: 'CONNECTED' };
   if (action === 'get') return getValue_(ss, body.key);
+  if (action === 'get_versioned') return getVersionedValue_(ss, body.key);
+  if (action === 'compare_and_set') return compareAndSetValue_(ss, body);
   if (action === 'set') return setValue_(ss, body.key, body.value);
   if (action === 'delete') return deleteValue_(ss, body.key);
   if (action === 'lease_start') return leaseStart_(ss, body);
@@ -45,23 +47,49 @@ function dispatch_(ss, body) {
 
 function getValue_(ss, key) {
   requireString_(key, 'key');
-  var sheet = ensureSheet_(ss, 'Persistence', ['key', 'value_json', 'updated_at']);
+  var sheet = ensureSheet_(ss, 'Persistence', ['key', 'value_json', 'updated_at', 'revision']);
   var row = findRow_(sheet, 1, String(key));
   if (!row) return { success: true, found: false, value: null };
   var raw = sheet.getRange(row, 2).getValue();
   return { success: true, found: true, value: JSON.parse(String(raw)) };
 }
 
+function getVersionedValue_(ss, key) {
+  requireString_(key, 'key');
+  var sheet = ensureSheet_(ss, 'Persistence', ['key', 'value_json', 'updated_at', 'revision']);
+  var row = findRow_(sheet, 1, String(key));
+  if (!row) return { success: true, found: false, value: null, revision: 0 };
+  var values = sheet.getRange(row, 2, 1, 3).getValues()[0];
+  return { success: true, found: true, value: JSON.parse(String(values[0])), revision: Number(values[2] || 0) };
+}
+
+function compareAndSetValue_(ss, body) {
+  requireString_(body.key, 'key');
+  if (body.expected_revision === undefined || body.new_value === undefined) throw new Error('expected_revision and new_value are required');
+  var expected = Number(body.expected_revision);
+  if (!isFinite(expected) || expected < 0 || Math.floor(expected) !== expected) throw new Error('expected_revision must be a non-negative integer');
+  var sheet = ensureSheet_(ss, 'Persistence', ['key', 'value_json', 'updated_at', 'revision']);
+  var key = String(body.key);
+  var row = findRow_(sheet, 1, key);
+  var currentRevision = row ? Number(sheet.getRange(row, 4).getValue() || 0) : 0;
+  if (currentRevision !== expected) return { success: true, updated: false, conflict: true, revision: currentRevision };
+  if (!row) row = Math.max(sheet.getLastRow() + 1, 2);
+  var nextRevision = currentRevision + 1;
+  sheet.getRange(row, 1, 1, 4).setValues([[key, JSON.stringify(body.new_value), new Date().toISOString(), nextRevision]]);
+  return { success: true, updated: true, revision: nextRevision };
+}
+
 function setValue_(ss, key, value) {
   requireString_(key, 'key');
   if (value === undefined) throw new Error('value is required');
-  var sheet = ensureSheet_(ss, 'Persistence', ['key', 'value_json', 'updated_at']);
+  var sheet = ensureSheet_(ss, 'Persistence', ['key', 'value_json', 'updated_at', 'revision']);
   var row = findRow_(sheet, 1, String(key));
+  var revision = row ? Number(sheet.getRange(row, 4).getValue() || 0) + 1 : 1;
   if (!row) row = Math.max(sheet.getLastRow() + 1, 2);
-  sheet.getRange(row, 1, 1, 3).setValues([[
-    String(key), JSON.stringify(value), new Date().toISOString()
+  sheet.getRange(row, 1, 1, 4).setValues([[
+    String(key), JSON.stringify(value), new Date().toISOString(), revision
   ]]);
-  return { success: true, action: 'SET', key: String(key) };
+  return { success: true, action: 'SET', key: String(key), revision: revision };
 }
 
 function deleteValue_(ss, key) {
@@ -161,6 +189,7 @@ function leaseSheet_(ss) {
 function ensureSheet_(ss, name, headers) {
   var sheet = ss.getSheetByName(name) || ss.insertSheet(name);
   if (sheet.getLastRow() === 0) sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  else if (name === 'Persistence' && !sheet.getRange(1, 4).getValue()) sheet.getRange(1, 4).setValue('revision');
   return sheet;
 }
 
