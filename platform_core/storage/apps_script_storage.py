@@ -119,3 +119,9 @@ class AppsScriptStorage:
             owner=owner,
             lease_seconds=lease_seconds
             )
+
+    def lease_inspect(self, task_id):
+        return self._request(
+            "lease_inspect",
+            task_id=task_id,
+        )
