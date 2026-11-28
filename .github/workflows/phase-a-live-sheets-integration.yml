@@ -75,3 +75,22 @@ jobs:
           GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
           GOOGLE_APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
         run: python scripts/live_apps_script_concurrency.py verify "${{ needs.initialize.outputs.test_key }}"
+
+  cleanup:
+    if: always() && needs.initialize.result == 'success'
+    needs: [initialize, concurrent-runners, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: work/phase-a-rca-01-hybrid-leases
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install minimal runtime dependency
+        run: python -m pip install requests
+      - name: Remove isolated test record
+        env:
+          GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+          GOOGLE_APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
+        run: python scripts/live_apps_script_concurrency.py cleanup "${{ needs.initialize.outputs.test_key }}"
