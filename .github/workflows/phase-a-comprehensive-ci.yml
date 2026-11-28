@@ -1,0 +1,110 @@
+name: Phase A Comprehensive Implementation CI
+
+on:
+  push:
+    branches:
+      - work/phase-a-rca-01-hybrid-leases
+    paths:
+      - '**.py'
+      - 'apps_script/**'
+      - 'tests/**'
+      - 'requirements*.txt'
+      - '.github/workflows/phase-a-comprehensive-ci.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '**.py'
+      - 'apps_script/**'
+      - 'tests/**'
+      - 'requirements*.txt'
+      - '.github/workflows/phase-a-comprehensive-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase-a-comprehensive-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Full Python implementation tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch / PR merge ref
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-persistence.txt
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-persistence.txt
+      - name: Run complete Python test suite
+        run: python -m pytest -q --junitxml=python-test-results.xml
+      - name: Compile all Python source files
+        run: python -m compileall -q platform_core tests
+
+      - name: Upload Python test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-a-python-test-results
+          path: python-test-results.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  apps-script-tests:
+    name: Apps Script backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch / PR merge ref
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run Apps Script backend tests
+        run: node --test tests/apps_script_backend.test.js
+
+  implementation-summary:
+    name: Implementation source integrity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch / PR merge ref
+        uses: actions/checkout@v4
+      - name: Verify Part 1 implementation files
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_files=(
+            "platform_core/execution/execution_engine.py"
+            "platform_core/execution/lease_manager.py"
+            "platform_core/orchestrator.py"
+            "platform_core/runtime.py"
+            "platform_core/storage/apps_script_storage.py"
+            "platform_core/storage/google_sheets.py"
+            "platform_core/storage/memory_storage.py"
+            "platform_core/task_queue/persistent_task_manager.py"
+            "platform_core/task_queue/recovery_controller.py"
+            "platform_core/task_queue/retry_controller.py"
+            "platform_core/task_queue/task_lifecycle_manager.py"
+            "apps_script/Code.gs"
+            "apps_script/README.md"
+            "tests/apps_script_backend.test.js"
+            "tests/test_phase_a_runtime_hardening.py"
+            "PART1_IMPLEMENTATION_REPORT.md"
+          )
+          for file in "${required_files[@]}"; do
+            test -s "$file"
+            echo "OK: $file"
+          done
+          echo "Verified ${#required_files[@]} required implementation files."
