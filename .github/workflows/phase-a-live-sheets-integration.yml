@@ -1,0 +1,77 @@
+name: Phase A Live Google Sheets CAS Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  initialize:
+    runs-on: ubuntu-latest
+    outputs:
+      test_key: ${{ steps.key.outputs.test_key }}
+    steps:
+      - name: Validate live integration secrets
+        env:
+          APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+          APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
+        run: |
+          test -n "$APPS_SCRIPT_URL" || { echo "Missing GOOGLE_APPS_SCRIPT_URL repository secret"; exit 1; }
+          test -n "$APPS_SCRIPT_TOKEN" || { echo "Missing GOOGLE_APPS_SCRIPT_TOKEN repository secret"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          ref: work/phase-a-rca-01-hybrid-leases
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install minimal runtime dependency
+        run: python -m pip install requests
+      - id: key
+        name: Create isolated test key
+        run: echo "test_key=ci-live-cas-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+      - name: Initialize isolated test record
+        env:
+          GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+          GOOGLE_APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
+        run: python scripts/live_apps_script_concurrency.py init "${{ steps.key.outputs.test_key }}"
+
+  concurrent-runners:
+    needs: initialize
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_id: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: work/phase-a-rca-01-hybrid-leases
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install minimal runtime dependency
+        run: python -m pip install requests
+      - name: Perform concurrent CAS updates
+        env:
+          GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+          GOOGLE_APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
+        run: python scripts/live_apps_script_concurrency.py worker "${{ needs.initialize.outputs.test_key }}"
+
+  verify:
+    needs: [initialize, concurrent-runners]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: work/phase-a-rca-01-hybrid-leases
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install minimal runtime dependency
+        run: python -m pip install requests
+      - name: Verify total updates and clean test record
+        env:
+          GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+          GOOGLE_APPS_SCRIPT_TOKEN: ${{ secrets.GOOGLE_APPS_SCRIPT_TOKEN }}
+        run: python scripts/live_apps_script_concurrency.py verify "${{ needs.initialize.outputs.test_key }}"
