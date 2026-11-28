@@ -84,3 +84,28 @@ test('serializes each request through the Apps Script project lock', () => {
   assert.equal(lockStats.waits, waitsBefore + 1);
   assert.equal(lockStats.releases, releasesBefore + 1);
 });
+
+
+test('versioned reads and compare-and-set reject stale revisions', () => {
+  const first = call('get_versioned', { key: 'cas-key' });
+  assert.equal(first.revision, 0);
+  const saved = call('compare_and_set', { key: 'cas-key', expected_revision: 0, new_value: { count: 1 } });
+  assert.equal(saved.updated, true);
+  assert.equal(saved.revision, 1);
+  const stale = call('compare_and_set', { key: 'cas-key', expected_revision: 0, new_value: { count: 99 } });
+  assert.equal(stale.conflict, true);
+  assert.equal(stale.revision, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(call('get_versioned', { key: 'cas-key' }).value)), { count: 1 });
+});
+
+test('compare-and-set write requires valid API token', () => {
+  const denied = call('compare_and_set', { key: 'secure', expected_revision: 0, new_value: { x: 1 } }, 'bad-token');
+  assert.equal(denied.success, false);
+  assert.equal(denied.error, 'UNAUTHORIZED');
+  assert.equal(call('get_versioned', { key: 'secure' }).found, false);
+});
+
+test('compare-and-set advances revision for each successful write', () => {
+  assert.equal(call('compare_and_set', { key: 'revision-key', expected_revision: 0, new_value: 1 }).revision, 1);
+  assert.equal(call('compare_and_set', { key: 'revision-key', expected_revision: 1, new_value: 2 }).revision, 2);
+});
