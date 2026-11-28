@@ -30,8 +30,9 @@ The uploaded main snapshot initially produced 182 passed and 6 failed in the ful
 
 ## Limitations not to overstate
 
-- `GoogleSheetsStorage.atomic_update()` is serialized only among threads in one Python process. It is not a distributed transaction across separate runners. The shared Apps Script lease prevents duplicate execution of the same task, but does not make the entire Google Sheets task collection safe for concurrent multi-runner writes.
-- The Apps Script backend passed local Node VM contract tests; it has not been deployed or tested against a live Google Spreadsheet/Web App.
+- `GoogleSheetsStorage.atomic_update()` is serialized only among threads in one Python process and must not be used for multi-runner task-queue writes. For shared multi-runner task storage, use `AppsScriptStorage`: `get_versioned` plus `compare_and_set` are executed under the Apps Script project `ScriptLock`, and `AppsScriptStorage.atomic_update()` retries revision conflicts. `PersistentTaskManager` automatically uses this adapter method when present.
+- The Apps Script `ScriptLock` is scoped to one Apps Script project. Do not deploy multiple independent Apps Script projects against the same spreadsheet and expect cross-project serialization.
+- The Apps Script backend and compare-and-set contract are covered by local Node VM tests; they have not been deployed or tested against a live Google Spreadsheet/Web App. A live integration test with two independent runners remains required before claiming production multi-runner verification.
 - This environment does not have `google-auth` or `google-api-python-client` installed, so live Google Sheets adapter initialization was not tested. Both are declared in the requirements. `requests` is installed.
 - `pip check` reports an unrelated pre-existing environment conflict: `moviepy 2.2.1` requires `pillow<12`, while Pillow 12.3.0 is installed.
 - No changes were pushed to GitHub. `main` remains untouched; this is a local-only branch/workspace created from the uploaded snapshot.
