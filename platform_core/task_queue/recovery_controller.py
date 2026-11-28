@@ -13,6 +13,7 @@ class RecoveryController:
         retry_controller,
         stale_after_seconds=900,
         clock=None,
+        lease_storage=None,
     ):
         if task_manager is None:
             raise ValueError("TaskManager is required")
@@ -32,6 +33,7 @@ class RecoveryController:
         self.lifecycle = lifecycle_manager
         self.retry_controller = retry_controller
         self.storage = task_manager.storage
+        self.lease_storage = lease_storage
 
         self.stale_after_seconds = stale_after_seconds
 
@@ -79,23 +81,31 @@ class RecoveryController:
             return None
 
     def has_active_lease(self, task):
-        """
-        Protect tasks with an unexpired execution lease.
+        """Use the lease backend as authority when it is available.
 
-        If an ACTIVE lease has an invalid or missing expiry,
-        fail safely and do not recover the task.
+        Backend errors or malformed responses fail closed: recovery must not
+        assume a lease is absent when its state cannot be verified.
         """
+        if self.lease_storage is not None:
+            inspect = getattr(self.lease_storage, "lease_inspect", None)
+            if not callable(inspect):
+                return True
+            try:
+                result = inspect(task.get("task_id"))
+            except Exception:
+                return True
+            if not isinstance(result, dict) or result.get("success") is not True:
+                return True
+            if not isinstance(result.get("active"), bool):
+                return True
+            return result["active"]
 
         if task.get("lease_status") != "ACTIVE":
             return False
 
-        lease_expires_at = self._parse_datetime(
-            task.get("lease_expires_at")
-        )
-
+        lease_expires_at = self._parse_datetime(task.get("lease_expires_at"))
         if lease_expires_at is None:
             return True
-
         return lease_expires_at > self._now()
 
     def _record_event(
@@ -104,13 +114,6 @@ class RecoveryController:
         event_type,
         details=None,
     ):
-        events = self.storage.get(
-            self.RECOVERY_STORAGE_KEY
-        )
-
-        if not isinstance(events, list):
-            events = []
-
         event = {
             "task_id": task_id,
             "event_type": event_type,
@@ -118,12 +121,20 @@ class RecoveryController:
             "details": deepcopy(details or {}),
         }
 
-        events.append(event)
-
-        self.storage.set(
-            self.RECOVERY_STORAGE_KEY,
-            events,
-        )
+        atomic_update = getattr(self.storage, "atomic_update", None)
+        if callable(atomic_update):
+            def append_event(events):
+                if not isinstance(events, list):
+                    events = []
+                events.append(event)
+                return events
+            atomic_update(self.RECOVERY_STORAGE_KEY, append_event)
+        else:
+            events = self.storage.get(self.RECOVERY_STORAGE_KEY)
+            if not isinstance(events, list):
+                events = []
+            events.append(event)
+            self.storage.set(self.RECOVERY_STORAGE_KEY, events)
 
         return event
 
