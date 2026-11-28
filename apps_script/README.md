@@ -19,6 +19,8 @@ The API creates `Persistence` and `ExecutionLeases` tabs on first use. ScriptLoc
 
 ## Actions
 
-`ping`, `get`, `set`, `delete`, `lease_start`, `lease_heartbeat`, `lease_check`, `lease_inspect`, `lease_release`.
+`ping`, `get`, `get_versioned`, `compare_and_set`, `set`, `delete`, `lease_start`, `lease_heartbeat`, `lease_check`, `lease_inspect`, `lease_release`.
+
+`get_versioned` returns a value and revision. `compare_and_set` checks the expected revision and writes the new value while holding the project ScriptLock. `AppsScriptStorage.atomic_update()` uses this compare-and-set operation with bounded retries; `PersistentTaskManager` automatically uses the adapter's `atomic_update` method. Use this Apps Script adapter for shared multi-runner task storage. The direct Google Sheets API adapter only offers process-local locking and is not a distributed concurrency solution. Existing Persistence rows are upgraded with a `revision` column on first access.
 
 All requests are JSON POST bodies with `token` and `action`. Lease start rejects a different owner while a lease is unexpired; heartbeat/check/release require the matching owner. `lease_inspect` returns authoritative active/expiry metadata for recovery without exposing the lease token.
