@@ -54,3 +54,11 @@ Development Principles
 Development Status
 
 Phase 1: Foundation Setup — In Progress
+
+
+## Hybrid storage and execution lease notes
+
+- Local development uses `InMemoryStorage` for task persistence and process-local leases.
+- Production runtime should inject a Google Sheets task store and a shared `AppsScriptStorage` lease adapter separately.
+- The Apps Script backend serializes its own requests with `LockService.getScriptLock()`; deploy one Apps Script project for the shared spreadsheet/lease namespace.
+- `GoogleSheetsStorage.atomic_update()` serializes threads only within one Python process. It is not a distributed transaction across independent runners. The shared lease prevents duplicate execution of the same task, but it does not make the entire Google Sheets task collection safe for concurrent multi-runner writes. Do not claim full multi-runner persistence safety until a distributed transactional task-store adapter is added and verified.
