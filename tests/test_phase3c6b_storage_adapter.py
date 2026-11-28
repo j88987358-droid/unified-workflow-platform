@@ -260,3 +260,16 @@ def test_atomic_update_fails_after_bounded_conflicts():
     storage = make_storage(session)
     with pytest.raises(RuntimeError, match="exceeded 2 retries"):
         storage.atomic_update("counter", lambda current: {"value": 1}, max_retries=2)
+
+
+def test_persistent_task_manager_uses_apps_script_atomic_update_across_instances():
+    from concurrent.futures import ThreadPoolExecutor
+    from platform_core.task_queue.persistent_task_manager import PersistentTaskManager
+    session = FakeSession()
+    managers = [PersistentTaskManager(make_storage(session)) for _ in range(5)]
+    def create(index):
+        return managers[index].create_task("worker", idempotency_key=f"job-{index}")
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        created = list(pool.map(create, range(5)))
+    assert len({task["task_id"] for task in created}) == 5
+    assert len(managers[0].list_tasks()) == 5
