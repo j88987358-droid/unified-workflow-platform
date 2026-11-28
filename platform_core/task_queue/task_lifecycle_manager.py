@@ -39,59 +39,45 @@ class TaskLifecycleManager:
         if new_status not in self.TRANSITIONS:
             raise ValueError("Unknown status")
 
-        data = self._load()
-        task = data["tasks"].get(task_id)
-
-        if task is None:
-            raise KeyError(task_id)
-
-        old_status = task["status"]
-
-        if new_status not in self.TRANSITIONS.get(
-            old_status, set()
-        ):
-            raise ValueError(
-                f"Invalid transition: {old_status} -> {new_status}"
-            )
-
         now = self._now()
 
-        task["status"] = new_status
-        task["updated_at"] = now
+        def apply(data):
+            task = data["tasks"].get(task_id)
+            if task is None:
+                raise KeyError(task_id)
 
-        if "history" not in task:
-            task["history"] = []
+            old_status = task["status"]
+            if new_status not in self.TRANSITIONS.get(old_status, set()):
+                raise ValueError(
+                    f"Invalid transition: {old_status} -> {new_status}"
+                )
 
-        event = {
-            "from_status": old_status,
-            "to_status": new_status,
-            "timestamp": now,
-            "details": details,
-        }
+            task["status"] = new_status
+            task["updated_at"] = now
+            task.setdefault("history", []).append({
+                "from_status": old_status,
+                "to_status": new_status,
+                "timestamp": now,
+                "details": deepcopy(details),
+            })
 
-        task["history"].append(event)
+            if new_status == "RUNNING":
+                task["started_at"] = now
+            elif new_status == "SUCCESS":
+                task["completed_at"] = now
+                if isinstance(details, dict) and "result" in details:
+                    task["result"] = deepcopy(details["result"])
+            elif new_status == "FAILED":
+                task["failed_at"] = now
+            elif new_status == "RETRY":
+                task["retry_count"] = task.get("retry_count", 0) + 1
+                task["last_retry_at"] = now
+            elif new_status == "DEAD_LETTER":
+                task["dead_letter_at"] = now
 
-        if new_status == "RUNNING":
-            task["started_at"] = now
+            return task
 
-        elif new_status == "SUCCESS":
-            task["completed_at"] = now
-
-        elif new_status == "FAILED":
-            task["failed_at"] = now
-
-        elif new_status == "RETRY":
-            task["retry_count"] = (
-                task.get("retry_count", 0) + 1
-            )
-            task["last_retry_at"] = now
-
-        elif new_status == "DEAD_LETTER":
-            task["dead_letter_at"] = now
-
-        self._save(data)
-
-        return deepcopy(task)
+        return self.task_manager.mutate_tasks(apply)
 
     def mark_running(self, task_id):
         return self.transition(task_id, "RUNNING")
