@@ -66,6 +66,14 @@ class FakeSession:
                 "key": key
             })
 
+        if action == "lease_inspect":
+            return FakeResponse({
+                "success": True,
+                "active": False,
+                "owner": None,
+                "expires_at": None,
+            })
+
         return FakeResponse({
             "success": False,
             "error": "UNKNOWN_ACTION"
@@ -194,3 +202,10 @@ def test_complex_json_values():
     storage.set("complex:key", value)
 
     assert storage.get("complex:key") == value
+
+
+def test_lease_inspect_returns_authoritative_backend_state():
+    storage = make_storage()
+    result = storage.lease_inspect("task-123")
+    assert result["success"] is True
+    assert result["active"] is False
