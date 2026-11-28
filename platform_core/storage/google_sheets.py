@@ -8,7 +8,8 @@ class GoogleSheetsStorage(BaseStorage):
     """Google Sheets key/value storage.
 
     atomic_update serializes callers within this Python process only. It is
-    not a distributed transaction across independent runners.
+    not safe for multi-runner task-queue writes. Use AppsScriptStorage with
+    its revision-based server-side compare-and-set for shared task storage.
     """
 
     _locks_guard = threading.Lock()
