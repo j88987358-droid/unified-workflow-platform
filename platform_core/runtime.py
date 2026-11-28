@@ -34,8 +34,31 @@ class WorkerHealthProbe:
 
 class ArchitectureRuntime:
 
-    def __init__(self, storage=None):
-        self.storage = storage or InMemoryStorage()
+    def __init__(self, storage=None, task_storage=None, lease_storage=None):
+        if storage is not None and task_storage is not None:
+            raise ValueError("Use either storage or task_storage, not both")
+
+        self.task_storage = (
+            task_storage if task_storage is not None
+            else storage if storage is not None
+            else InMemoryStorage()
+        )
+        self.storage = self.task_storage  # Backward-compatible alias.
+
+        required_lease_methods = (
+            "lease_start", "lease_heartbeat", "lease_check", "lease_release",
+            "lease_inspect",
+        )
+        if lease_storage is None and all(
+            callable(getattr(self.task_storage, name, None))
+            for name in required_lease_methods
+        ):
+            # Local mode: InMemoryStorage provides both interfaces.
+            self.lease_storage = self.task_storage
+        else:
+            # Production mode must inject the shared Apps Script lease adapter.
+            self.lease_storage = lease_storage
+
         self.initialized = False
 
     def _create_lease_manager(self):
@@ -55,8 +78,14 @@ class ArchitectureRuntime:
             f"{uuid.uuid4().hex}"
         )
 
+        if self.lease_storage is None:
+            raise RuntimeError(
+                "A lease_storage adapter is required; configure a shared "
+                "AppsScriptStorage for production or InMemoryStorage locally"
+            )
+
         return ExecutionLeaseManager(
-            storage=self.storage,
+            storage=self.lease_storage,
             lease_seconds=180,
             heartbeat_interval=60,
             owner=owner,
@@ -65,9 +94,22 @@ class ArchitectureRuntime:
     def initialize(self):
         if self.initialized:
             return self.components
+        required_lease_methods = (
+            "lease_start", "lease_heartbeat", "lease_check", "lease_release",
+            "lease_inspect",
+        )
+        missing_lease_methods = [
+            name for name in required_lease_methods
+            if not callable(getattr(self.lease_storage, name, None))
+        ] if self.lease_storage is not None else list(required_lease_methods)
+        if missing_lease_methods:
+            raise RuntimeError(
+                "Lease storage is missing required methods: "
+                + ", ".join(missing_lease_methods)
+            )
 
         self.components = ArchitectureInitializer().initialize(
-            task_storage=self.storage
+            task_storage=self.task_storage
         )
 
         self.worker_registry = self.components[
@@ -87,7 +129,7 @@ class ArchitectureRuntime:
         ]
 
         self.checkpoints = CheckpointManager(
-            self.storage,
+            self.task_storage,
             namespace="architecture",
         )
 
@@ -110,6 +152,7 @@ class ArchitectureRuntime:
             task_manager=self.task_manager,
             lifecycle_manager=self.lifecycle_manager,
             retry_controller=self.retry_controller,
+            lease_storage=self.lease_storage,
         )
 
         self.execution_engine = ExecutionEngine(
@@ -124,6 +167,7 @@ class ArchitectureRuntime:
             self.worker_manager,
             self.task_manager,
             self.checkpoints,
+            execution_engine=self.execution_engine,
         )
 
         self.previous_state = self.state_loader.restore(
@@ -182,7 +226,7 @@ class ArchitectureRuntime:
 
         if result["status"] == "SUCCESS":
             self.metrics["tasks_completed"] += 1
-        else:
+        elif result["status"] in {"FAILED", "RETRY", "DEAD_LETTER"}:
             self.metrics["tasks_failed"] += 1
 
         self.save_state()

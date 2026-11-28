@@ -79,6 +79,33 @@ class AppsScriptStorage:
             value=value
         )
 
+    def atomic_update(self, key, updater, max_retries=10):
+        """Update a key with server-side compare-and-set and bounded retries.
+
+        The updater can run more than once after a conflict; avoid side effects.
+        """
+        if not callable(updater):
+            raise TypeError("updater must be callable")
+        if not isinstance(max_retries, int) or max_retries < 1:
+            raise ValueError("max_retries must be a positive integer")
+
+        for _ in range(max_retries):
+            current = self._request("get_versioned", key=key)
+            value = current.get("value") if current.get("found") else None
+            revision = current.get("revision", 0)
+            updated_value = updater(value)
+            result = self._request(
+                "compare_and_set", key=key,
+                expected_revision=revision, new_value=updated_value,
+            )
+            if result.get("updated"):
+                return updated_value
+            if not result.get("conflict"):
+                raise RuntimeError("Storage compare-and-set failed")
+        raise RuntimeError(
+            f"Storage update conflict: exceeded {max_retries} retries for {key!r}"
+        )
+
     def delete(self, key):
         return self._request("delete", key=key)
 
@@ -119,3 +146,9 @@ class AppsScriptStorage:
             owner=owner,
             lease_seconds=lease_seconds
             )
+
+    def lease_inspect(self, task_id):
+        return self._request(
+            "lease_inspect",
+            task_id=task_id,
+        )

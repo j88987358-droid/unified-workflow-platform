@@ -106,17 +106,16 @@ class RetryController:
         now = self._now()
         next_retry = now + timedelta(seconds=delay)
 
-        data = self._load()
-        saved_task = data["tasks"][task_id]
+        def save_retry_metadata(data):
+            saved_task = data["tasks"].get(task_id)
+            if saved_task is None:
+                raise KeyError(task_id)
+            saved_task["last_error"] = error
+            saved_task["backoff_seconds"] = delay
+            saved_task["next_retry_at"] = next_retry.isoformat()
+            return saved_task
 
-        saved_task["last_error"] = error
-        saved_task["backoff_seconds"] = delay
-        saved_task["next_retry_at"] = (
-            next_retry.isoformat()
-        )
-
-        self._save(data)
-
+        self.task_manager.mutate_tasks(save_retry_metadata)
         return self.task_manager.get_task(task_id)
 
     def get_due_retries(self):

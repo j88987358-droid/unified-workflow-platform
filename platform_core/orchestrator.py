@@ -5,10 +5,12 @@ class ExecutionOrchestrator:
         worker_manager,
         task_manager,
         checkpoint_manager,
+        execution_engine=None,
     ):
         self.worker_manager = worker_manager
         self.task_manager = task_manager
         self.checkpoints = checkpoint_manager
+        self.execution_engine = execution_engine
 
     def register_worker(self, worker_id, worker, context=None):
         self.worker_manager.register(worker_id, worker)
@@ -32,45 +34,9 @@ class ExecutionOrchestrator:
         )
 
     def execute_task(self, task_id):
-        task = self.task_manager.get_task(task_id)
-
-        if task is None:
-            raise KeyError(task_id)
-
-        if task["status"] != "PENDING":
-            raise ValueError(
-                "Only PENDING tasks can be executed"
+        """Delegate execution to the single authoritative execution engine."""
+        if self.execution_engine is None:
+            raise RuntimeError(
+                "ExecutionEngine must be injected; direct worker execution is disabled"
             )
-
-        worker_id = task["payload"]["worker_id"]
-
-        self.task_manager.update_status(
-            task_id, "RUNNING"
-        )
-
-        try:
-            result = self.worker_manager.execute(
-                worker_id,
-                task["payload"]["data"],
-            )
-
-            self.task_manager.update_status(
-                task_id, "SUCCESS"
-            )
-
-            return {
-                "task_id": task_id,
-                "status": "SUCCESS",
-                "result": result,
-            }
-
-        except Exception as exc:
-            self.task_manager.update_status(
-                task_id, "FAILED"
-            )
-
-            return {
-                "task_id": task_id,
-                "status": "FAILED",
-                "error": str(exc),
-            }
+        return self.execution_engine.execute_task(task_id)

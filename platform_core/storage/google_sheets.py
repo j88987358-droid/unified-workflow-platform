@@ -1,9 +1,19 @@
 import json
+import threading
 from datetime import datetime, timezone
 
 from .base_storage import BaseStorage
 
 class GoogleSheetsStorage(BaseStorage):
+    """Google Sheets key/value storage.
+
+    atomic_update serializes callers within this Python process only. It is
+    not safe for multi-runner task-queue writes. Use AppsScriptStorage with
+    its revision-based server-side compare-and-set for shared task storage.
+    """
+
+    _locks_guard = threading.Lock()
+    _locks = {}
 
     def __init__(self, spreadsheet_id, worksheet="Persistence"):
         import os
@@ -34,6 +44,9 @@ class GoogleSheetsStorage(BaseStorage):
 
         self.spreadsheet_id = spreadsheet_id
         self.worksheet = worksheet
+        lock_key = (spreadsheet_id, worksheet)
+        with self._locks_guard:
+            self._lock = self._locks.setdefault(lock_key, threading.RLock())
         self._ensure_header()
 
     def _range(self):
@@ -64,12 +77,25 @@ class GoogleSheetsStorage(BaseStorage):
         return result.get("values", [])
 
     def get(self, key):
-        for row in self._rows()[1:]:
-            if row and row[0] == key:
-                return json.loads(row[1])
+        with self._lock:
+            for row in self._rows()[1:]:
+                if row and row[0] == key:
+                    return json.loads(row[1])
         return None
 
+    def atomic_update(self, key, updater):
+        if not callable(updater):
+            raise TypeError("updater must be callable")
+        with self._lock:
+            updated = updater(self.get(key))
+            self.set(key, updated)
+            return updated
+
     def set(self, key, value):
+        with self._lock:
+            return self._set_unlocked(key, value)
+
+    def _set_unlocked(self, key, value):
         rows = self._rows()
         now = datetime.now(timezone.utc).isoformat()
         encoded = json.dumps(value, ensure_ascii=False)
@@ -96,6 +122,10 @@ class GoogleSheetsStorage(BaseStorage):
         return True
 
     def delete(self, key):
+        with self._lock:
+            return self._delete_unlocked(key)
+
+    def _delete_unlocked(self, key):
         rows = self._rows()
 
         for index, row in enumerate(rows[1:], start=2):

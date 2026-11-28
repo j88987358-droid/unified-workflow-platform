@@ -89,7 +89,7 @@ def test_runtime_requires_initialization():
     except RuntimeError:
         assert True
 
-def test_failed_task():
+def test_failed_task_is_scheduled_for_retry():
     class BrokenWorker(ExampleWorker):
         def execute(self, task):
             raise ValueError("Test failure")
@@ -101,7 +101,38 @@ def test_failed_task():
     task = runtime.submit_task("broken")
     result = runtime.execute_task(task["task_id"])
 
-    assert result["status"] == "FAILED"
+    # Phase 3C introduced automatic retry scheduling. A worker error is
+    # first recorded as FAILED in history, then moved to RETRY by policy.
+    assert result["status"] == "RETRY"
+    assert result["retry_count"] == 1
     assert runtime.metrics["tasks_failed"] == 1
 
     runtime.shutdown()
+
+
+def test_worker_input_cannot_override_task_metadata():
+    from platform_core.execution.execution_engine import ExecutionEngine
+
+    task = {
+        "task_id": "real-task-id",
+        "status": "RUNNING",
+        "payload": {
+            "data": {
+                "task_id": "forged-task-id",
+                "status": "SUCCESS",
+                "value": 123,
+            }
+        },
+    }
+
+    engine = ExecutionEngine(
+        task_manager=object(),
+        lifecycle_manager=object(),
+        retry_controller=object(),
+        worker_manager=object(),
+    )
+    worker_input = engine._worker_input(task)
+
+    assert worker_input["value"] == 123
+    assert worker_input["task_id"] == "real-task-id"
+    assert worker_input["status"] == "RUNNING"

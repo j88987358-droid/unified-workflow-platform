@@ -29,6 +29,18 @@ class ExecutionLeaseManager:
                 "Heartbeat interval must be shorter than lease duration"
             )
 
+        required_methods = (
+            "lease_start",
+            "lease_heartbeat",
+            "lease_check",
+            "lease_release",
+        )
+        missing = [name for name in required_methods if not callable(getattr(storage, name, None))]
+        if missing:
+            raise TypeError(
+                "Lease storage is missing required methods: " + ", ".join(missing)
+            )
+
         self.storage = storage
         self.lease_seconds = lease_seconds
         self.heartbeat_interval = heartbeat_interval
@@ -52,6 +64,16 @@ class ExecutionLeaseManager:
             owner=self.owner,
             lease_seconds=self.lease_seconds,
         )
+
+        if not isinstance(result, dict) or not result.get("success"):
+            error = (
+                result.get("error", "LEASE_START_FAILED")
+                if isinstance(result, dict)
+                else "INVALID_LEASE_START_RESPONSE"
+            )
+            raise RuntimeError(f"Could not acquire execution lease: {error}")
+        if result.get("valid") is False:
+            raise RuntimeError("Could not acquire execution lease: lease is invalid")
 
         self._task_id = task_id
         self._error = None
@@ -89,11 +111,22 @@ class ExecutionLeaseManager:
             self.heartbeat_interval
         ):
             try:
-                self.storage.lease_heartbeat(
+                result = self.storage.lease_heartbeat(
                     task_id=self._task_id,
                     owner=self.owner,
                     lease_seconds=self.lease_seconds,
                 )
+                if (
+                    not isinstance(result, dict)
+                    or not result.get("success")
+                    or result.get("valid") is False
+                ):
+                    error = (
+                        result.get("error", "LEASE_HEARTBEAT_REJECTED")
+                        if isinstance(result, dict)
+                        else "INVALID_LEASE_HEARTBEAT_RESPONSE"
+                    )
+                    raise RuntimeError(str(error))
 
             except Exception as exc:
                 self._error = exc

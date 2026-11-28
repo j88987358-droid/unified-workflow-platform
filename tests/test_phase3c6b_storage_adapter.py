@@ -1,4 +1,5 @@
 import json
+import threading
 import pytest
 
 from platform_core.storage.apps_script_storage import (
@@ -23,6 +24,9 @@ class FakeSession:
     def __init__(self):
         self.data = {}
         self.calls = []
+        self.lock = threading.Lock()
+        self.revisions = {}
+        self.force_conflicts = 0
 
     def post(self, url, json, timeout, allow_redirects):
         self.calls.append(json)
@@ -36,8 +40,25 @@ class FakeSession:
                 "status": "CONNECTED"
             })
 
+        if action == "get_versioned":
+            with self.lock:
+                return FakeResponse({"success": True, "found": key in self.data, "value": self.data.get(key), "revision": self.revisions.get(key, 0)})
+
+        if action == "compare_and_set":
+            with self.lock:
+                current = self.revisions.get(key, 0)
+                if self.force_conflicts:
+                    self.force_conflicts -= 1
+                    return FakeResponse({"success": True, "updated": False, "conflict": True, "revision": current})
+                if json.get("expected_revision") != current:
+                    return FakeResponse({"success": True, "updated": False, "conflict": True, "revision": current})
+                self.data[key] = json.get("new_value")
+                self.revisions[key] = current + 1
+                return FakeResponse({"success": True, "updated": True, "revision": current + 1})
+
         if action == "set":
             self.data[key] = json.get("value")
+            self.revisions[key] = self.revisions.get(key, 0) + 1
             return FakeResponse({
                 "success": True,
                 "action": "SET",
@@ -64,6 +85,14 @@ class FakeSession:
                 "success": True,
                 "action": "DELETE",
                 "key": key
+            })
+
+        if action == "lease_inspect":
+            return FakeResponse({
+                "success": True,
+                "active": False,
+                "owner": None,
+                "expires_at": None,
             })
 
         return FakeResponse({
@@ -194,3 +223,53 @@ def test_complex_json_values():
     storage.set("complex:key", value)
 
     assert storage.get("complex:key") == value
+
+
+def test_lease_inspect_returns_authoritative_backend_state():
+    storage = make_storage()
+    result = storage.lease_inspect("task-123")
+    assert result["success"] is True
+    assert result["active"] is False
+
+
+def test_atomic_update_retries_revision_conflict_and_preserves_update():
+    session = FakeSession()
+    storage = make_storage(session)
+    storage.set("counter", {"value": 0})
+    session.force_conflicts = 1
+    result = storage.atomic_update("counter", lambda current: {"value": current["value"] + 1})
+    assert result == {"value": 1}
+    assert storage.get("counter") == {"value": 1}
+
+
+def test_atomic_update_concurrent_instances_do_not_lose_increments():
+    from concurrent.futures import ThreadPoolExecutor
+    session = FakeSession()
+    storages = [make_storage(session) for _ in range(10)]
+    storages[0].set("counter", {"value": 0})
+    def increment(storage):
+        return storage.atomic_update("counter", lambda current: {"value": current["value"] + 1}, max_retries=100)
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        list(pool.map(increment, storages))
+    assert storages[0].get("counter") == {"value": 10}
+
+
+def test_atomic_update_fails_after_bounded_conflicts():
+    session = FakeSession()
+    session.force_conflicts = 2
+    storage = make_storage(session)
+    with pytest.raises(RuntimeError, match="exceeded 2 retries"):
+        storage.atomic_update("counter", lambda current: {"value": 1}, max_retries=2)
+
+
+def test_persistent_task_manager_uses_apps_script_atomic_update_across_instances():
+    from concurrent.futures import ThreadPoolExecutor
+    from platform_core.task_queue.persistent_task_manager import PersistentTaskManager
+    session = FakeSession()
+    managers = [PersistentTaskManager(make_storage(session)) for _ in range(5)]
+    def create(index):
+        return managers[index].create_task("worker", idempotency_key=f"job-{index}")
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        created = list(pool.map(create, range(5)))
+    assert len({task["task_id"] for task in created}) == 5
+    assert len(managers[0].list_tasks()) == 5

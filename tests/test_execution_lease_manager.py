@@ -209,3 +209,39 @@ def test_thread_start_failure_releases_acquired_lease(
     assert "start" in actions
     assert "release" in actions
     assert manager._started is False
+
+
+def test_start_rejects_lease_already_held():
+    storage = MockStorage()
+    storage.lease_start = lambda **kwargs: {
+        "success": False,
+        "valid": False,
+        "error": "LEASE_ALREADY_HELD",
+    }
+    manager = ExecutionLeaseManager(storage, heartbeat_interval=10)
+
+    with pytest.raises(RuntimeError, match="LEASE_ALREADY_HELD"):
+        manager.start("task-123")
+
+    assert manager._started is False
+    assert manager._thread is None
+
+
+def test_heartbeat_rejects_explicit_lease_loss():
+    storage = MockStorage()
+    storage.lease_heartbeat = lambda **kwargs: {
+        "success": False,
+        "valid": False,
+        "error": "LEASE_NOT_HELD",
+    }
+    manager = ExecutionLeaseManager(
+        storage,
+        lease_seconds=30,
+        heartbeat_interval=0.1,
+    )
+
+    manager.start("task-123")
+    assert manager._stop_event.wait(timeout=2)
+
+    with pytest.raises(RuntimeError, match="heartbeat failed"):
+        manager.stop()
